@@ -19,6 +19,7 @@ pub mod peer;
 pub mod prof;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pubsub;
+pub mod swap_ad;
 pub mod utils;
 pub mod watchtower;
 #[cfg(not(target_arch = "wasm32"))]
@@ -318,6 +319,21 @@ pub mod server {
                     .merge(GraphRpcServerImpl::new(network_graph.clone(), store.clone()).into_rpc())
                     .unwrap();
             }
+        }
+        // Swap advertisement market (W3) — always enabled when store is available
+        {
+            use crate::rpc::swap_ad::{SwapAdRpcServer, SwapAdRpcServerImpl};
+            modules
+                .merge(
+                    SwapAdRpcServerImpl::new(
+                        store.clone(),
+                        ckb_config.clone(),
+                        None,
+                        network_actor.clone(),
+                    )
+                    .into_rpc(),
+                )
+                .unwrap();
         }
         if let Some(network_actor) = network_actor {
             if config.is_module_enabled("info") {
