@@ -43,6 +43,7 @@ pub mod invoice;
 pub mod payment;
 pub mod peer;
 pub mod prof;
+pub mod swap_ad;
 #[cfg(feature = "watchtower")]
 pub mod watchtower;
 
@@ -60,5 +61,6 @@ pub use prof::*;
 pub use serde_utils::Hash256;
 pub use serde_utils::Privkey;
 pub use serde_utils::Pubkey;
+pub use swap_ad::*;
 #[cfg(feature = "watchtower")]
 pub use watchtower::*;

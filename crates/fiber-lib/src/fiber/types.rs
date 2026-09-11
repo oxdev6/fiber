@@ -17,8 +17,8 @@ pub use fiber_types::{
     ChannelUpdateMessageFlags, Cursor, EcdsaSignature, FeatureVector, Hash256, HashAlgorithm,
     NodeAnnouncement, OnionPacketError, PartialSignatureAsBytes, PaymentCustomRecords,
     PaymentOnionPacket, PeeledPaymentOnionPacket, Privkey, PubNonceAsBytes, Pubkey, RemoveTlc,
-    RemoveTlcReason, RevokeAndAck, TlcErr, UnknownHashAlgorithmError, CURSOR_SIZE,
-    ONION_PACKET_VERSION_V1, ONION_SESSION_KEY_MAX_ATTEMPTS,
+    RemoveTlcReason, RevokeAndAck, SwapAdvertisement, TlcErr, UnknownHashAlgorithmError,
+    CURSOR_SIZE, ONION_PACKET_VERSION_V1, ONION_SESSION_KEY_MAX_ATTEMPTS,
 };
 
 use molecule::prelude::{Builder, Byte, Entity};
@@ -1086,6 +1086,7 @@ pub enum BroadcastMessageWithTimestamp {
     NodeAnnouncement(NodeAnnouncement),
     ChannelAnnouncement(u64, ChannelAnnouncement),
     ChannelUpdate(ChannelUpdate),
+    SwapAdvertisement(SwapAdvertisement),
 }
 
 impl BroadcastMessageWithTimestamp {
@@ -1100,6 +1101,7 @@ impl BroadcastMessageWithTimestamp {
             BroadcastMessageWithTimestamp::ChannelUpdate(channel_update) => {
                 channel_update.chain_hash
             }
+            BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => swap_ad.chain_hash,
         }
     }
 
@@ -1121,6 +1123,7 @@ impl BroadcastMessageWithTimestamp {
                 channel_update.timestamp,
                 BroadcastMessageID::ChannelUpdate(channel_update.channel_outpoint.clone()),
             ),
+            BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => swap_ad.cursor(),
         }
     }
 
@@ -1133,6 +1136,7 @@ impl BroadcastMessageWithTimestamp {
             BroadcastMessageWithTimestamp::ChannelUpdate(channel_update) => {
                 channel_update.timestamp
             }
+            BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => swap_ad.timestamp,
         }
     }
 
@@ -1148,6 +1152,12 @@ impl BroadcastMessageWithTimestamp {
             }
             BroadcastMessageWithTimestamp::ChannelUpdate(channel_update) => {
                 BroadcastMessageID::ChannelUpdate(channel_update.channel_outpoint.clone())
+            }
+            BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => {
+                let hash = ckb_hash::blake2b_256(swap_ad.message_to_sign());
+                let mut hash256 = [0u8; 32];
+                hash256.copy_from_slice(&hash[..32]);
+                BroadcastMessageID::SwapAdvertisement(Hash256::from(hash256))
             }
         }
     }
@@ -1176,6 +1186,9 @@ impl From<(BroadcastMessage, Option<ChannelOnchainInfo>)> for BroadcastMessageWi
             BroadcastMessage::ChannelUpdate(channel_update) => {
                 BroadcastMessageWithTimestamp::ChannelUpdate(channel_update)
             }
+            BroadcastMessage::SwapAdvertisement(swap_ad) => {
+                BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad)
+            }
         }
     }
 }
@@ -1191,6 +1204,9 @@ impl From<BroadcastMessageWithTimestamp> for BroadcastMessage {
             }
             BroadcastMessageWithTimestamp::ChannelUpdate(channel_update) => {
                 BroadcastMessage::ChannelUpdate(channel_update)
+            }
+            BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => {
+                BroadcastMessage::SwapAdvertisement(swap_ad)
             }
         }
     }
@@ -1209,6 +1225,10 @@ impl From<(BroadcastMessage, u64)> for BroadcastMessageWithTimestamp {
             BroadcastMessage::ChannelUpdate(channel_update) => {
                 debug_assert_eq!(timestamp, channel_update.timestamp);
                 BroadcastMessageWithTimestamp::ChannelUpdate(channel_update)
+            }
+            BroadcastMessage::SwapAdvertisement(swap_ad) => {
+                debug_assert_eq!(timestamp, swap_ad.timestamp);
+                BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad)
             }
         }
     }

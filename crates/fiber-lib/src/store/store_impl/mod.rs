@@ -1848,6 +1848,67 @@ impl GossipMessageStore for Store {
         batch.commit();
     }
 
+    fn get_latest_swap_advertisement_timestamp(
+        &self,
+        hash: &Hash256,
+    ) -> Option<u64> {
+        self.get(
+            [
+                [BROADCAST_MESSAGE_TIMESTAMP_PREFIX].as_slice(),
+                BroadcastMessageID::SwapAdvertisement(*hash)
+                    .to_bytes()
+                    .as_slice(),
+            ]
+            .concat(),
+        )
+        .map(|v| u64::from_be_bytes(v.try_into().expect("Invalid timestamp value length")))
+    }
+
+    fn save_swap_advertisement(
+        &self,
+        swap_advertisement: crate::fiber::types::SwapAdvertisement,
+    ) {
+        debug_assert!(
+            swap_advertisement.verify(),
+            "Swap advertisement must be verified: {:?}",
+            swap_advertisement
+        );
+        // Use blake2b of message_to_sign as identifier (same as BroadcastMessageID)
+        let hash = {
+            let h = ckb_hash::blake2b_256(swap_advertisement.message_to_sign());
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h[..32]);
+            Hash256::from(arr)
+        };
+        let message_id = BroadcastMessageID::SwapAdvertisement(hash);
+        let mut batch = self.batch();
+        if let Some(old_timestamp) = self.get_latest_swap_advertisement_timestamp(&hash) {
+            if swap_advertisement.timestamp <= old_timestamp {
+                return;
+            }
+            batch.delete(
+                [
+                    &[BROADCAST_MESSAGE_PREFIX],
+                    Cursor::new(old_timestamp, message_id.clone())
+                        .to_bytes()
+                        .as_slice(),
+                ]
+                .concat(),
+            );
+        }
+        let kv = KeyValue::BroadcastMessageTimestamp(
+            message_id.clone(),
+            swap_advertisement.timestamp,
+        );
+        batch.put(kv.key(), kv.value());
+        let kv = KeyValue::BroadcastMessage(
+            Cursor::new(swap_advertisement.timestamp, message_id),
+            BroadcastMessage::SwapAdvertisement(swap_advertisement.clone()),
+        );
+        batch.put(kv.key(), kv.value());
+        batch.commit();
+    }
+
     fn get_channel_timestamps_iter(&self) -> impl IntoIterator<Item = (OutPoint, [u64; 3])> {
         // 0 is used to get timestamps for channels instead of node announcements.
         const PREFIX: [u8; 2] = [BROADCAST_MESSAGE_TIMESTAMP_PREFIX, 0];

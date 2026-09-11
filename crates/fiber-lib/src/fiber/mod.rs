@@ -5,6 +5,7 @@ pub mod graph;
 pub mod history;
 pub mod network;
 pub mod payment;
+pub mod swap_advertisement;
 #[cfg(all(feature = "pprof", not(target_arch = "wasm32")))]
 pub mod profiling;
 pub mod types;

@@ -611,6 +611,9 @@ where
                 BroadcastMessageWithTimestamp::NodeAnnouncement(node_announcement) => {
                     self.process_node_announcement(node_announcement);
                 }
+                BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => {
+                    debug!("ignore swap advertisement in graph: {:?}", swap_ad);
+                }
             }
         }
         return true;

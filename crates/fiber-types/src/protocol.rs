@@ -578,6 +578,129 @@ impl ChannelUpdate {
     }
 }
 
+/// SwapAdvertisement is a signed operator rate for one asset pair (RGB++ UDT ↔ CKB UDT).
+#[serde_as]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
+pub struct SwapAdvertisement {
+    /// Signature of the operator (ECDSA over blake2b_256 of unsigned bytes)
+    pub signature: Option<EcdsaSignature>,
+    /// Chain hash (prevents cross-chain replay)
+    pub chain_hash: Hash256,
+    /// Base UDT script (e.g., RGB++ xUDT) — None for CKB native (future)
+    #[serde_as(as = "Option<EntityHex>")]
+    pub base_udt_script: Option<Script>,
+    /// Quote UDT script (target CKB UDT) — None for CKB native
+    #[serde_as(as = "Option<EntityHex>")]
+    pub quote_udt_script: Option<Script>,
+    /// Rate: quote per base * 1e8 (as in schema-draft)
+    pub rate: u128,
+    /// Fee rate: proportional millionths
+    pub fee_rate: u128,
+    /// Operator node pubkey (must match signature)
+    pub operator_pubkey: Pubkey,
+    /// Broadcast timestamp (millis) — drives Cursor ordering
+    pub timestamp: u64,
+    /// Expiry timestamp (millis) — after this, ad is invalid/pruned
+    pub expiry: u64,
+}
+
+impl SwapAdvertisement {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unsigned(
+        chain_hash: Hash256,
+        base_udt_script: Option<Script>,
+        quote_udt_script: Option<Script>,
+        rate: u128,
+        fee_rate: u128,
+        operator_pubkey: Pubkey,
+        timestamp: u64,
+        expiry: u64,
+    ) -> Self {
+        Self {
+            signature: None,
+            chain_hash,
+            base_udt_script,
+            quote_udt_script,
+            rate,
+            fee_rate,
+            operator_pubkey,
+            timestamp,
+            expiry,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed(
+        chain_hash: Hash256,
+        base_udt_script: Option<Script>,
+        quote_udt_script: Option<Script>,
+        rate: u128,
+        fee_rate: u128,
+        private_key: &Privkey,
+        timestamp: u64,
+        expiry: u64,
+    ) -> Self {
+        let mut unsigned = Self::new_unsigned(
+            chain_hash,
+            base_udt_script,
+            quote_udt_script,
+            rate,
+            fee_rate,
+            private_key.pubkey(),
+            timestamp,
+            expiry,
+        );
+        unsigned.signature = Some(private_key.sign(unsigned.message_to_sign()));
+        unsigned
+    }
+
+    pub fn message_to_sign(&self) -> [u8; 32] {
+        let unsigned = SwapAdvertisement {
+            signature: None,
+            chain_hash: self.chain_hash,
+            base_udt_script: self.base_udt_script.clone(),
+            quote_udt_script: self.quote_udt_script.clone(),
+            rate: self.rate,
+            fee_rate: self.fee_rate,
+            operator_pubkey: self.operator_pubkey,
+            timestamp: self.timestamp,
+            expiry: self.expiry,
+        };
+        deterministically_hash(&molecule_gossip::SwapAdvertisement::from(unsigned))
+    }
+
+    pub fn cursor(&self) -> Cursor {
+        // Use blake2b_256 of content as message_id (32 bytes)
+        let hash = ckb_hash::blake2b_256(self.message_to_sign());
+        let mut hash256 = [0u8; 32];
+        hash256.copy_from_slice(&hash[..32]);
+        // For Cursor we need BroadcastMessageID::SwapAdvertisement(Hash256)
+        // Hash256 is 32 bytes, will be padded to 36 with 4 zero in to_bytes
+        Cursor::new(
+            self.timestamp,
+            BroadcastMessageID::SwapAdvertisement(Hash256::from(hash256)),
+        )
+    }
+
+    pub fn verify(&self) -> bool {
+        if self.rate == 0 {
+            return false;
+        }
+        if self.expiry <= self.timestamp {
+            return false;
+        }
+        let message = self.message_to_sign();
+        match self.signature {
+            Some(ref sig) => sig.verify(&self.operator_pubkey, &message),
+            None => false,
+        }
+    }
+
+    pub fn is_expired(&self, now: u64) -> bool {
+        now >= self.expiry
+    }
+}
+
 impl ChannelAnnouncement {
     /// Get the message bytes to sign (hash of unsigned molecule serialization).
     pub fn message_to_sign(&self) -> [u8; 32] {
@@ -716,6 +839,8 @@ pub enum BroadcastMessage {
     ChannelAnnouncement(ChannelAnnouncement),
     /// Channel update message
     ChannelUpdate(ChannelUpdate),
+    /// Swap advertisement message (operator rate for RGB++ ↔ CKB UDT)
+    SwapAdvertisement(SwapAdvertisement),
 }
 
 impl BroadcastMessage {
@@ -727,6 +852,7 @@ impl BroadcastMessage {
             BroadcastMessage::NodeAnnouncement(node_announcement) => {
                 Some(node_announcement.cursor())
             }
+            BroadcastMessage::SwapAdvertisement(swap_ad) => Some(swap_ad.cursor()),
         }
     }
 
@@ -744,6 +870,13 @@ impl BroadcastMessage {
             BroadcastMessage::ChannelUpdate(channel_update) => {
                 BroadcastMessageID::ChannelUpdate(channel_update.channel_outpoint.clone())
             }
+            BroadcastMessage::SwapAdvertisement(swap_ad) => {
+                // Hash-based ID (consistent with protocol.rs SwapAdvertisement::cursor)
+                let hash = ckb_hash::blake2b_256(swap_ad.message_to_sign());
+                let mut hash256 = [0u8; 32];
+                hash256.copy_from_slice(&hash[..32]);
+                BroadcastMessageID::SwapAdvertisement(Hash256::from(hash256))
+            }
         }
     }
 
@@ -755,6 +888,7 @@ impl BroadcastMessage {
             }
             BroadcastMessage::ChannelAnnouncement(_) => None,
             BroadcastMessage::ChannelUpdate(channel_update) => Some(channel_update.timestamp),
+            BroadcastMessage::SwapAdvertisement(swap_ad) => Some(swap_ad.timestamp),
         }
     }
 }
@@ -793,6 +927,7 @@ pub enum BroadcastMessageID {
     ChannelAnnouncement(OutPoint),
     ChannelUpdate(OutPoint),
     NodeAnnouncement(Pubkey),
+    SwapAdvertisement(Hash256),
 }
 
 impl Default for BroadcastMessageID {
@@ -805,9 +940,21 @@ impl Default for BroadcastMessageID {
 // so that we can use it as the sorting key in fn prune_messages_to_be_saved to simplify the logic.
 // We need to implement Ord for BroadcastMessageID to make sure that a ChannelUpdate message is always ordered after ChannelAnnouncement,
 // so that we can use it as the sorting key in fn prune_messages_to_be_saved to simplify the logic.
-// Ordering: NodeAnnouncement < ChannelAnnouncement < ChannelUpdate
+// Ordering: NodeAnnouncement < ChannelAnnouncement < ChannelUpdate < SwapAdvertisement
 impl Ord for BroadcastMessageID {
     fn cmp(&self, other: &Self) -> Ordering {
+        fn discriminant(id: &BroadcastMessageID) -> u8 {
+            match id {
+                BroadcastMessageID::NodeAnnouncement(_) => 0,
+                BroadcastMessageID::ChannelAnnouncement(_) => 1,
+                BroadcastMessageID::ChannelUpdate(_) => 2,
+                BroadcastMessageID::SwapAdvertisement(_) => 3,
+            }
+        }
+        let ord = discriminant(self).cmp(&discriminant(other));
+        if ord != Ordering::Equal {
+            return ord;
+        }
         match (self, other) {
             (
                 BroadcastMessageID::ChannelAnnouncement(outpoint1),
@@ -821,15 +968,11 @@ impl Ord for BroadcastMessageID {
                 BroadcastMessageID::NodeAnnouncement(node1),
                 BroadcastMessageID::NodeAnnouncement(node2),
             ) => node1.cmp(node2),
-            (BroadcastMessageID::NodeAnnouncement(_), _) => Ordering::Less,
-            (BroadcastMessageID::ChannelUpdate(_), _) => Ordering::Greater,
             (
-                BroadcastMessageID::ChannelAnnouncement(_),
-                BroadcastMessageID::NodeAnnouncement(_),
-            ) => Ordering::Greater,
-            (BroadcastMessageID::ChannelAnnouncement(_), BroadcastMessageID::ChannelUpdate(_)) => {
-                Ordering::Less
-            }
+                BroadcastMessageID::SwapAdvertisement(hash1),
+                BroadcastMessageID::SwapAdvertisement(hash2),
+            ) => hash1.as_ref().cmp(hash2.as_ref()),
+            _ => Ordering::Equal,
         }
     }
 }
@@ -860,6 +1003,11 @@ impl BroadcastMessageID {
                 let node_id = node_id.serialize();
                 result[1..1 + node_id.len()].copy_from_slice(&node_id);
             }
+            BroadcastMessageID::SwapAdvertisement(hash) => {
+                result[0] = 3;
+                result[1..1 + 32].copy_from_slice(hash.as_ref());
+                // remaining 4 bytes already zero (padding)
+            }
         };
         result
     }
@@ -879,6 +1027,9 @@ impl BroadcastMessageID {
             2 => Ok(BroadcastMessageID::NodeAnnouncement(Pubkey::from_slice(
                 &bytes[1..1 + Pubkey::serialization_len()],
             )?)),
+            3 => Ok(BroadcastMessageID::SwapAdvertisement(
+                Hash256::try_from(&bytes[1..33])?,
+            )),
             _ => anyhow::bail!("Invalid message id type: {}", bytes[0]),
         }
     }
@@ -1129,6 +1280,45 @@ impl TryFrom<molecule_fiber::ChannelUpdate> for ChannelUpdate {
     }
 }
 
+impl From<SwapAdvertisement> for molecule_gossip::SwapAdvertisement {
+    fn from(swap_ad: SwapAdvertisement) -> Self {
+        let builder = molecule_gossip::SwapAdvertisement::new_builder()
+            .chain_hash(swap_ad.chain_hash.into())
+            .base_udt_script(swap_ad.base_udt_script.pack())
+            .quote_udt_script(swap_ad.quote_udt_script.pack())
+            .rate(swap_ad.rate.pack())
+            .fee_rate(swap_ad.fee_rate.pack())
+            .operator_pubkey(swap_ad.operator_pubkey.into())
+            .timestamp(swap_ad.timestamp.pack())
+            .expiry(swap_ad.expiry.pack());
+        let builder = if let Some(sig) = swap_ad.signature {
+            builder.signature(sig.into())
+        } else {
+            builder
+        };
+        builder.build()
+    }
+}
+
+impl TryFrom<molecule_gossip::SwapAdvertisement> for SwapAdvertisement {
+    type Error = anyhow::Error;
+
+    fn try_from(swap_ad: molecule_gossip::SwapAdvertisement) -> Result<Self, Self::Error> {
+        use ckb_types::prelude::Unpack;
+        Ok(SwapAdvertisement {
+            signature: Some(swap_ad.signature().try_into()?),
+            chain_hash: swap_ad.chain_hash().into(),
+            base_udt_script: swap_ad.base_udt_script().to_opt(),
+            quote_udt_script: swap_ad.quote_udt_script().to_opt(),
+            rate: swap_ad.rate().unpack(),
+            fee_rate: swap_ad.fee_rate().unpack(),
+            operator_pubkey: swap_ad.operator_pubkey().try_into()?,
+            timestamp: swap_ad.timestamp().unpack(),
+            expiry: swap_ad.expiry().unpack(),
+        })
+    }
+}
+
 impl Ord for BroadcastMessage {
     fn cmp(&self, other: &Self) -> Ordering {
         self.message_id()
@@ -1157,6 +1347,9 @@ impl From<BroadcastMessage> for molecule_gossip::BroadcastMessageUnion {
             BroadcastMessage::ChannelUpdate(channel_update) => {
                 molecule_gossip::BroadcastMessageUnion::ChannelUpdate(channel_update.into())
             }
+            BroadcastMessage::SwapAdvertisement(swap_ad) => {
+                molecule_gossip::BroadcastMessageUnion::SwapAdvertisement(swap_ad.into())
+            }
         }
     }
 }
@@ -1179,6 +1372,9 @@ impl TryFrom<molecule_gossip::BroadcastMessageUnion> for BroadcastMessage {
             molecule_gossip::BroadcastMessageUnion::ChannelUpdate(channel_update) => {
                 Ok(BroadcastMessage::ChannelUpdate(channel_update.try_into()?))
             }
+            molecule_gossip::BroadcastMessageUnion::SwapAdvertisement(swap_ad) => {
+                Ok(BroadcastMessage::SwapAdvertisement(swap_ad.try_into()?))
+            }
         }
     }
 }
@@ -1198,6 +1394,12 @@ impl TryFrom<molecule_gossip::BroadcastMessage> for BroadcastMessage {
         fiber_broadcast_message: molecule_gossip::BroadcastMessage,
     ) -> Result<Self, Self::Error> {
         fiber_broadcast_message.to_enum().try_into()
+    }
+}
+
+impl From<SwapAdvertisement> for BroadcastMessage {
+    fn from(value: SwapAdvertisement) -> Self {
+        BroadcastMessage::SwapAdvertisement(value)
     }
 }
 
@@ -1342,5 +1544,89 @@ mod tests {
         let serialize_result = std::panic::catch_unwind(|| serde_json::to_string(&node_name));
         assert!(serialize_result.is_ok());
         assert!(serialize_result.expect("panic checked").is_err());
+    }
+
+    #[test]
+    fn swap_advertisement_sign_verify_roundtrip() {
+        let privkey = Privkey::from_slice(&[42u8; 32]);
+        let chain_hash = Hash256::default();
+        let ad = SwapAdvertisement::new_signed(
+            chain_hash,
+            None,
+            None,
+            10000000000u128,
+            3000u128,
+            &privkey,
+            1000,
+            2000,
+        );
+        assert!(ad.verify(), "signed ad should verify");
+        // molecule roundtrip
+        let mol = molecule_gossip::SwapAdvertisement::from(ad.clone());
+        let ad2 = SwapAdvertisement::try_from(mol).expect("molecule roundtrip");
+        assert_eq!(ad, ad2);
+        assert!(ad2.verify());
+    }
+
+    #[test]
+    fn swap_advertisement_tampered_sig_rejected() {
+        let privkey = Privkey::from_slice(&[42u8; 32]);
+        let mut ad = SwapAdvertisement::new_signed(
+            Hash256::default(),
+            None,
+            None,
+            1000u128,
+            1000u128,
+            &privkey,
+            1000,
+            2000,
+        );
+        assert!(ad.verify());
+        // tamper rate
+        ad.rate = 9999;
+        assert!(!ad.verify(), "tampered rate should fail verify");
+    }
+
+    #[test]
+    fn swap_advertisement_expired_rejected() {
+        let privkey = Privkey::from_slice(&[42u8; 32]);
+        let ad = SwapAdvertisement::new_signed(
+            Hash256::default(),
+            None,
+            None,
+            1000u128,
+            1000u128,
+            &privkey,
+            2000,
+            1000, // expiry before timestamp
+        );
+        assert!(!ad.verify(), "expiry <= timestamp should fail");
+        assert!(ad.is_expired(1500), "should be expired at 1500");
+        assert!(!ad.is_expired(500), "not expired at 500");
+    }
+
+    #[test]
+    fn swap_advertisement_broadcast_message_roundtrip() {
+        let privkey = Privkey::from_slice(&[99u8; 32]);
+        let ad = SwapAdvertisement::new_signed(
+            Hash256::default(),
+            None,
+            None,
+            5000u128,
+            100u128,
+            &privkey,
+            123456789,
+            123466789,
+        );
+        let bm = BroadcastMessage::SwapAdvertisement(ad.clone());
+        let mol_bm = molecule_gossip::BroadcastMessage::from(bm.clone());
+        let bm2 = BroadcastMessage::try_from(mol_bm).expect("broadcast roundtrip");
+        assert_eq!(bm, bm2);
+        if let BroadcastMessage::SwapAdvertisement(ad2) = bm2 {
+            assert!(ad2.verify());
+            assert_eq!(ad2.timestamp, 123456789);
+        } else {
+            panic!("wrong variant");
+        }
     }
 }

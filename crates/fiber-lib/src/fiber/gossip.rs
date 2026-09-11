@@ -68,7 +68,7 @@ use super::{
 };
 use fiber_types::{
     BroadcastMessage, BroadcastMessageID, ChannelAnnouncement, ChannelUpdate, Cursor, Hash256,
-    NodeAnnouncement, Pubkey,
+    NodeAnnouncement, Pubkey, SwapAdvertisement,
 };
 
 // The maximum duration drift between the broadcast message timestamp and latest cursor in store.
@@ -146,6 +146,7 @@ fn broadcast_message_type(message: &BroadcastMessage) -> &'static str {
         BroadcastMessage::ChannelAnnouncement(_) => "channel_announcement",
         BroadcastMessage::ChannelUpdate(_) => "channel_update",
         BroadcastMessage::NodeAnnouncement(_) => "node_announcement",
+        BroadcastMessage::SwapAdvertisement(_) => "swap_advertisement",
     }
 }
 
@@ -345,6 +346,58 @@ pub trait GossipMessageStore {
 
     fn save_node_announcement(&self, node_announcement: NodeAnnouncement);
 
+    fn save_swap_advertisement(&self, swap_advertisement: SwapAdvertisement);
+
+    fn get_latest_swap_advertisement_timestamp(&self, hash: &Hash256) -> Option<u64>;
+
+    fn get_latest_swap_advertisement(
+        &self,
+        hash: &Hash256,
+    ) -> Option<(u64, SwapAdvertisement)> {
+        self.get_latest_swap_advertisement_timestamp(hash).and_then(|timestamp| {
+            self.get_broadcast_message_with_cursor(&Cursor::new(
+                timestamp,
+                BroadcastMessageID::SwapAdvertisement(*hash),
+            ))
+            .map(|msg| match msg {
+                BroadcastMessageWithTimestamp::SwapAdvertisement(ad) => (timestamp, ad),
+                _ => panic!(
+                    "get_latest_swap_advertisement returned non-SwapAdvertisement: hash {:?}, msg {:?}",
+                    hash, msg
+                ),
+            })
+        })
+    }
+
+    fn get_swap_advertisements(
+        &self,
+        after_cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Vec<(Cursor, SwapAdvertisement)> {
+        let cursor = after_cursor.cloned().unwrap_or_default();
+        self.get_broadcast_messages(&cursor, limit)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                BroadcastMessageWithTimestamp::SwapAdvertisement(ad) => {
+                    let c = ad.cursor();
+                    if &c > &cursor {
+                        Some((c, ad))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn get_active_swap_advertisements(&self, now: u64) -> Vec<SwapAdvertisement> {
+        self.get_swap_advertisements(None, 0)
+            .into_iter()
+            .filter_map(|(_, ad)| if !ad.is_expired(now) { Some(ad) } else { None })
+            .collect()
+    }
+
     fn get_channel_timestamps_iter(&self) -> impl IntoIterator<Item = (OutPoint, [u64; 3])>;
 
     fn delete_channel_timestamps(&self, outpoint: &OutPoint);
@@ -370,6 +423,9 @@ fn is_remote_cursor_candidate<S: GossipMessageStore>(
                     && channel_announcement.node2_id != *local_pubkey
             })
             .unwrap_or(false),
+        BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => {
+            swap_ad.operator_pubkey != *local_pubkey
+        }
     }
 }
 
@@ -1866,6 +1922,9 @@ impl<S: GossipMessageStore + Clone, C: CkbChainClient + Clone>
                 BroadcastMessageWithTimestamp::NodeAnnouncement(node_announcement) => {
                     self.store.save_node_announcement(node_announcement.clone());
                 }
+                BroadcastMessageWithTimestamp::SwapAdvertisement(swap_ad) => {
+                    self.store.save_swap_advertisement(swap_ad.clone());
+                }
             }
         }
     }
@@ -2087,6 +2146,7 @@ impl<S: GossipMessageStore + Clone, C: CkbChainClient + Clone>
             BroadcastMessage::NodeAnnouncement(msg) => msg.chain_hash,
             BroadcastMessage::ChannelAnnouncement(msg) => msg.chain_hash,
             BroadcastMessage::ChannelUpdate(msg) => msg.chain_hash,
+            BroadcastMessage::SwapAdvertisement(msg) => msg.chain_hash,
         };
         if msg_chain_hash != get_chain_hash() {
             return Err(GossipMessageProcessingError::ProcessingError(format!(
@@ -2197,6 +2257,17 @@ impl<S: GossipMessageStore + Clone, C: CkbChainClient + Clone>
                 node_announcement.timestamp,
                 BroadcastMessageID::NodeAnnouncement(node_announcement.node_id),
             )),
+            BroadcastMessage::SwapAdvertisement(swap_ad) => {
+                let hash = {
+                    let h = ckb_hash::blake2b_256(swap_ad.message_to_sign());
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&h[..32]);
+                    Hash256::from(arr)
+                };
+                self.store
+                    .get_latest_swap_advertisement_timestamp(&hash)
+                    .map(|timestamp| Cursor::new(timestamp, BroadcastMessageID::SwapAdvertisement(hash)))
+            }
         }
     }
 
@@ -3344,6 +3415,17 @@ fn get_existing_broadcast_message<S: GossipMessageStore>(
             .map(|store_node_announcement| {
                 BroadcastMessageWithTimestamp::NodeAnnouncement(store_node_announcement)
             }),
+        BroadcastMessage::SwapAdvertisement(swap_ad) => {
+            let hash = {
+                let h = ckb_hash::blake2b_256(swap_ad.message_to_sign());
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h[..32]);
+                Hash256::from(arr)
+            };
+            store
+                .get_latest_swap_advertisement(&hash)
+                .map(|(_, ad)| BroadcastMessageWithTimestamp::SwapAdvertisement(ad))
+        }
     }
 }
 
@@ -3374,6 +3456,7 @@ async fn verify_and_save_broadcast_message<S: GossipMessageStore>(
         BroadcastMessage::NodeAnnouncement(msg) => msg.chain_hash,
         BroadcastMessage::ChannelAnnouncement(msg) => msg.chain_hash,
         BroadcastMessage::ChannelUpdate(msg) => msg.chain_hash,
+        BroadcastMessage::SwapAdvertisement(msg) => msg.chain_hash,
     };
     if msg_chain_hash != get_chain_hash() {
         return Err(VerifyBroadcastMessageError::InvalidParameter(format!(
@@ -3418,6 +3501,33 @@ async fn verify_and_save_broadcast_message<S: GossipMessageStore>(
                 store.save_node_announcement(node_announcement.clone());
             }
             (node_announcement.timestamp, !already_saved)
+        }
+        BroadcastMessage::SwapAdvertisement(swap_ad) => {
+            // Verify swap advertisement
+            if !swap_ad.verify() {
+                return Err(VerifyBroadcastMessageError::InvalidParameter(
+                    "Invalid swap advertisement signature".to_string(),
+                ));
+            }
+            if swap_ad.is_expired(crate::now_timestamp_as_millis_u64()) {
+                return Err(VerifyBroadcastMessageError::InvalidParameter(
+                    "Swap advertisement expired".to_string(),
+                ));
+            }
+            // Check if already saved (by hash)
+            let hash = {
+                let h = ckb_hash::blake2b_256(swap_ad.message_to_sign());
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h[..32]);
+                Hash256::from(arr)
+            };
+            let already_saved = store
+                .get_latest_swap_advertisement(&hash)
+                .is_some_and(|(_, existing)| existing == *swap_ad);
+            if !already_saved {
+                store.save_swap_advertisement(swap_ad.clone());
+            }
+            (swap_ad.timestamp, !already_saved)
         }
     };
     Ok(((message.clone(), timestamp).into(), is_newly_applied))

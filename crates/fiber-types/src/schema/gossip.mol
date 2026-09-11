@@ -10,6 +10,7 @@ array SchnorrXOnlyPubkey [byte; 32];
 // ChannelAnnouncement (union ID 0): channel_outpoint, 36 bytes
 // ChannelUpdate (union ID 1): channel_outpoint, 36 bytes
 // NodeAnnouncement (union ID 2): node_id 33 bytes padding 3 zero bytes
+// SwapAdvertisement (union ID 3): blake2b_256(content)[32] + 4 zero padding (36)
 // All broadcast messages are sorted by Cursor in dictionary order,
 // so whenever we pass a `after_cursor` parameter below, we want data that
 // come after the `after_cursor` in dictionary order, which basically means that we
@@ -75,11 +76,26 @@ table ChannelAnnouncement {
     udt_type_script: ScriptOpt,
 }
 
+// SwapAdvertisement is a signed operator rate for one asset pair (RGB++ UDT ↔ CKB UDT).
+// Signature is Ecdsa over blake2b_256 of canonical bytes without signature (like NodeAnnouncement).
+table SwapAdvertisement {
+    signature: EcdsaSignature,
+    chain_hash: Byte32,
+    base_udt_script: ScriptOpt,
+    quote_udt_script: ScriptOpt,
+    rate: Uint128,
+    fee_rate: Uint128,
+    operator_pubkey: Pubkey,
+    timestamp: Uint64,
+    expiry: Uint64,
+}
+
 // All the broadcast messages.
 union BroadcastMessage {
     NodeAnnouncement,
     ChannelAnnouncement,
     ChannelUpdate,
+    SwapAdvertisement,
 }
 
 vector BroadcastMessages <BroadcastMessage>;
