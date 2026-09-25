@@ -1,5 +1,5 @@
 mod order_store;
 pub(crate) mod state_machine;
 
-pub use order_store::CchOrderStore;
+pub use order_store::{CchOrderStore, SwapOrderStore};
 pub use state_machine::CchOrderStateMachine;

@@ -17,7 +17,7 @@ pub use config::CchConfig;
 
 mod order;
 pub use order::state_machine::CchOrderStateMachine;
-pub use order::CchOrderStore;
+pub use order::{CchOrderStore, SwapOrderStore};
 
 mod actions;
 

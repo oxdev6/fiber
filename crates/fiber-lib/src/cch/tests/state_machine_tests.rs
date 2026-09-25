@@ -501,3 +501,145 @@ fn test_is_final_returns_false_for_in_progress_statuses() {
         assert!(!order.is_final(), "Expected {:?} to not be final", status);
     }
 }
+
+/// Helper to build a minimal signed test invoice for swap orders.
+fn test_swap_invoice() -> fiber_types::CkbInvoice {
+    use crate::invoice::InvoiceBuilder;
+    use fiber_types::Currency;
+    use secp256k1::SECP256K1;
+    let secret = secp256k1::SecretKey::from_slice(&[42u8; 32]).unwrap();
+    InvoiceBuilder::new(Currency::Fibd)
+        .amount(Some(100))
+        .payment_hash(test_payment_hash(9))
+        .build_with_sign(|msg| SECP256K1.sign_ecdsa_recoverable(msg, &secret))
+        .unwrap()
+}
+
+fn dummy_swap_script(byte: u8) -> ckb_types::packed::Script {
+    use ckb_types::prelude::{Builder, Entity};
+    let mut h = [0u8; 32];
+    h[0] = byte;
+    ckb_types::packed::Script::new_builder()
+        .code_hash(ckb_types::packed::Byte32::from_slice(&h).unwrap())
+        .hash_type(ckb_types::core::ScriptHashType::Type)
+        .args(ckb_types::packed::Bytes::from(vec![byte]))
+        .build()
+}
+
+/// Helper to create a test SwapOrder whose payment hash matches `preimage`.
+fn create_test_swap_order(
+    preimage: Hash256,
+    payment_hash: Hash256,
+) -> fiber_types::SwapOrder {
+    fiber_types::SwapOrder::new(
+        1_700_000_000,
+        3_600,
+        Hash256::default(),
+        Some(dummy_swap_script(1)),
+        Some(dummy_swap_script(2)),
+        10_000_000_000,
+        3_000,
+        100,
+        payment_hash,
+        test_swap_invoice(),
+        "fiber-pay-req-placeholder".to_string(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_swap_order_full_lifecycle_through_shared_machine() {
+    use crate::cch::order::state_machine::CchOrderEvent;
+
+    let (preimage, payment_hash) = create_valid_preimage_pair(7);
+    let mut order = create_test_swap_order(preimage, payment_hash);
+    assert_eq!(order.status, CchOrderStatus::Pending);
+
+    // Leg progress: incoming invoice received.
+    let next = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::IncomingInvoiceChanged {
+            status: CkbInvoiceStatus::Received,
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(next, Some(CchOrderStatus::IncomingAccepted));
+
+    // Outgoing leg in flight.
+    let next = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::OutgoingPaymentChanged {
+            status: PaymentStatus::Inflight,
+            payment_preimage: None,
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(next, Some(CchOrderStatus::OutgoingInFlight));
+
+    // Outgoing settles with preimage reveal.
+    let next = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::OutgoingPaymentChanged {
+            status: PaymentStatus::Success,
+            payment_preimage: Some(preimage),
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(next, Some(CchOrderStatus::OutgoingSuccess));
+    assert_eq!(order.payment_preimage, Some(preimage));
+
+    // Incoming leg settles -> order success.
+    let next = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::IncomingInvoiceChanged {
+            status: CkbInvoiceStatus::Paid,
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(next, Some(CchOrderStatus::Success));
+    assert!(order.failure_reason.is_none());
+}
+
+#[test]
+fn test_swap_order_rejects_bad_transitions_like_cch() {
+    use crate::cch::order::state_machine::CchOrderEvent;
+
+    let (preimage, payment_hash) = create_valid_preimage_pair(8);
+    let mut order = create_test_swap_order(preimage, payment_hash);
+
+    // Outgoing event on a Pending order is rejected, same as CchOrder.
+    let err = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::OutgoingPaymentChanged {
+            status: PaymentStatus::Inflight,
+            payment_preimage: None,
+            failure_reason: None,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CchError::InvalidTransition(_, _)));
+
+    // Wrong preimage is rejected.
+    let _ = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::IncomingInvoiceChanged {
+            status: CkbInvoiceStatus::Received,
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    let err = CchOrderStateMachine::apply_to(
+        &mut order,
+        CchOrderEvent::OutgoingPaymentChanged {
+            status: PaymentStatus::Success,
+            payment_preimage: Some(test_payment_hash(99)),
+            failure_reason: None,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CchError::PreimageHashMismatch));
+}

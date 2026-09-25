@@ -33,6 +33,10 @@ pub mod sample;
 
 #[cfg(feature = "cch")]
 pub use cch::{CchInvoice, CchOrder, CchOrderStatus};
+#[cfg(feature = "cch")]
+pub mod swap;
+#[cfg(feature = "cch")]
+pub use swap::{SwapOrder, SwapOrderError};
 pub use channel::*;
 pub use config::*;
 pub use invoice::*;

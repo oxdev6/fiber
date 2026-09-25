@@ -33,6 +33,8 @@ use fiber_store::migration::{
 use fiber_types::schema::*;
 #[cfg(not(target_arch = "wasm32"))]
 use fiber_types::CchOrder;
+#[cfg(not(target_arch = "wasm32"))]
+use fiber_types::SwapOrder;
 use fiber_types::{
     Attempt, AttemptStatus, BroadcastMessage, BroadcastMessageID, ChannelOpenRecord, ChannelState,
     Cursor, Direction, Hash256, PaymentCustomRecords, PaymentSession, PaymentStatus,
@@ -289,6 +291,10 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
             CCH_ORDER_PREFIX => {
                 check_deserialization::<CchOrder>(&value, "CCH_ORDER_PREFIX", &mut errors);
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            SWAP_ORDER_PREFIX => {
+                check_deserialization::<SwapOrder>(&value, "SWAP_ORDER_PREFIX", &mut errors);
+            }
             #[cfg(feature = "watchtower")]
             WATCHTOWER_CHANNEL_PREFIX => {
                 check_deserialization::<ChannelData>(
@@ -401,6 +407,8 @@ pub enum KeyValue {
     HoldTlc((Hash256, Hash256, u64), u64),
     #[cfg(not(target_arch = "wasm32"))]
     CchOrder(Hash256, CchOrder),
+    #[cfg(not(target_arch = "wasm32"))]
+    SwapOrder(Hash256, SwapOrder),
     ChannelOpenRecord(Hash256, ChannelOpenRecord),
 }
 
@@ -526,6 +534,10 @@ impl StoreKeyValue for KeyValue {
             KeyValue::CchOrder(payment_hash, _data) => {
                 [&[CCH_ORDER_PREFIX], payment_hash.as_ref()].concat()
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            KeyValue::SwapOrder(payment_hash, _data) => {
+                [&[SWAP_ORDER_PREFIX], payment_hash.as_ref()].concat()
+            }
             KeyValue::ChannelOpenRecord(channel_id, _) => {
                 [&[CHANNEL_OPEN_RECORD_PREFIX], channel_id.as_ref()].concat()
             }
@@ -570,6 +582,8 @@ impl StoreKeyValue for KeyValue {
             KeyValue::HoldTlc(_, expired_at) => serialize_to_vec(expired_at, "HoldTlc"),
             #[cfg(not(target_arch = "wasm32"))]
             KeyValue::CchOrder(_, cch_order) => serialize_to_vec(cch_order, "CchOrder"),
+            #[cfg(not(target_arch = "wasm32"))]
+            KeyValue::SwapOrder(_, swap_order) => serialize_to_vec(swap_order, "SwapOrder"),
             KeyValue::ChannelOpenRecord(_, record) => serialize_to_vec(record, "ChannelOpenRecord"),
         }
     }
@@ -1971,6 +1985,50 @@ impl CchOrderStore for Store {
 
     fn delete_cch_order(&self, payment_hash: &Hash256) {
         let key = [&[CCH_ORDER_PREFIX], payment_hash.as_ref()].concat();
+        let mut batch = self.batch();
+        batch.delete(key);
+        batch.commit();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::cch::SwapOrderStore for Store {
+    fn get_swap_order(&self, payment_hash: &Hash256) -> Result<SwapOrder, CchStoreError> {
+        let key = [&[SWAP_ORDER_PREFIX], payment_hash.as_ref()].concat();
+        self.get(key)
+            .map(|v| deserialize_from(&v, "SwapOrder"))
+            .ok_or(CchStoreError::NotFound(*payment_hash))
+    }
+
+    fn insert_swap_order(&self, order: SwapOrder) -> Result<(), CchStoreError> {
+        let key = [&[SWAP_ORDER_PREFIX], order.payment_hash.as_ref()].concat();
+        if self.get(&key).is_some() {
+            return Err(CchStoreError::Duplicated(order.payment_hash));
+        }
+        let mut batch = self.batch();
+        let kv = KeyValue::SwapOrder(order.payment_hash, order);
+        batch.put(kv.key(), kv.value());
+        batch.commit();
+        Ok(())
+    }
+
+    fn update_swap_order(&self, order: SwapOrder) {
+        let mut batch = self.batch();
+        let kv = KeyValue::SwapOrder(order.payment_hash, order);
+        batch.put(kv.key(), kv.value());
+        batch.commit();
+    }
+
+    fn get_swap_order_keys_iter(&self) -> impl IntoIterator<Item = Hash256> {
+        const PREFIX_LEN: usize = 1;
+        const PREFIX: [u8; PREFIX_LEN] = [SWAP_ORDER_PREFIX];
+        self.collect_by_prefix(&PREFIX).into_iter().map(|kv| {
+            Hash256::try_from(&kv.key[PREFIX_LEN..]).expect("SwapOrder key must be Hash256")
+        })
+    }
+
+    fn delete_swap_order(&self, payment_hash: &Hash256) {
+        let key = [&[SWAP_ORDER_PREFIX], payment_hash.as_ref()].concat();
         let mut batch = self.batch();
         batch.delete(key);
         batch.commit();

@@ -1625,3 +1625,115 @@ mod store_actor_tests {
         );
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+mod swap_order_tests {
+    use super::*;
+    use crate::cch::SwapOrderStore;
+    use fiber_types::invoice::{CkbInvoice, Currency, InvoiceData};
+    use fiber_types::{CchInvoice, CchOrder, CchOrderStatus, SwapOrder};
+
+    fn dummy_packed_script(byte: u8) -> ckb_types::packed::Script {
+        use ckb_types::prelude::{Builder, Entity};
+        let mut h = [0u8; 32];
+        h[0] = byte;
+        ckb_types::packed::Script::new_builder()
+            .code_hash(ckb_types::packed::Byte32::from_slice(&h).unwrap())
+            .hash_type(ckb_types::core::ScriptHashType::Type)
+            .args(ckb_types::packed::Bytes::from(vec![byte]))
+            .build()
+    }
+
+    fn dummy_ckb_invoice() -> CkbInvoice {
+        use crate::invoice::InvoiceBuilder;
+        use secp256k1::SECP256K1;
+        let secret = secp256k1::SecretKey::from_slice(&[42u8; 32]).unwrap();
+        InvoiceBuilder::new(Currency::Fibd)
+            .amount(Some(100))
+            .payment_hash(Hash256::default())
+            .build_with_sign(|msg| SECP256K1.sign_ecdsa_recoverable(msg, &secret))
+            .expect("test invoice builds")
+    }
+
+    fn make_swap_order(payment_hash: Hash256, rate: u128) -> SwapOrder {
+        SwapOrder::new(
+            1_000,
+            3_600,
+            Hash256::default(),
+            Some(dummy_packed_script(1)),
+            Some(dummy_packed_script(2)),
+            rate,
+            3_000,
+            100,
+            payment_hash,
+            dummy_ckb_invoice(),
+            "fiber-invoice-placeholder".to_string(),
+        )
+        .unwrap()
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn test_store_save_swap_order() {
+        let (store, _dir) = generate_store();
+        let hash = gen_rand_sha256_hash();
+        let order = make_swap_order(hash, 10_000_000_000);
+        assert!(store.insert_swap_order(order.clone()).is_ok());
+        // Duplicate insert must fail.
+        assert!(store.insert_swap_order(order.clone()).is_err());
+        let got = store.get_swap_order(&hash).unwrap();
+        assert_eq!(got.rate, 10_000_000_000);
+        // 100 base units @ 100.0 (100*1e8) -> 10_000 quote units.
+        assert_eq!(got.quote_amount, 10_000);
+        assert_eq!(got.status, CchOrderStatus::Pending);
+        // Update path.
+        let mut updated = got.clone();
+        updated.status = CchOrderStatus::Success;
+        store.update_swap_order(updated.clone());
+        assert_eq!(
+            store.get_swap_order(&hash).unwrap().status,
+            CchOrderStatus::Success
+        );
+        // Keys iter + delete.
+        let keys: Vec<_> = store.get_swap_order_keys_iter().into_iter().collect();
+        assert!(keys.contains(&hash));
+        store.delete_swap_order(&hash);
+        assert!(store.get_swap_order(&hash).is_err());
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn test_swap_order_prefix_isolation() {
+        use crate::cch::CchOrderStore;
+        let (store, _dir) = generate_store();
+        // Same payment hash under both prefixes must not collide.
+        let hash = gen_rand_sha256_hash();
+        let swap = make_swap_order(hash, 5_000_000_000);
+        let cch = CchOrder {
+            created_at: 1_000,
+            expiry_delta_seconds: 3_600,
+            wrapped_btc_type_script: ckb_jsonrpc_types::Script {
+                code_hash: Default::default(),
+                hash_type: ckb_jsonrpc_types::ScriptHashType::Type,
+                args: Default::default(),
+            },
+            outgoing_pay_req: "lnbc-placeholder".to_string(),
+            incoming_invoice: CchInvoice::Fiber(dummy_ckb_invoice()),
+            payment_hash: hash,
+            payment_preimage: None,
+            amount_sats: 1_000,
+            fee_sats: 10,
+            status: CchOrderStatus::Pending,
+            failure_reason: None,
+        };
+        store.insert_swap_order(swap).unwrap();
+        store.insert_cch_order(cch).unwrap();
+        // Each reads back its own kind.
+        assert_eq!(store.get_swap_order(&hash).unwrap().rate, 5_000_000_000);
+        assert_eq!(store.get_cch_order(&hash).unwrap().amount_sats, 1_000);
+        // Deleting one leaves the other intact.
+        store.delete_swap_order(&hash);
+        assert!(store.get_swap_order(&hash).is_err());
+        assert!(store.get_cch_order(&hash).is_ok());
+    }
+}
