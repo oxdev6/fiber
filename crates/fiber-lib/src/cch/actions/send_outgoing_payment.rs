@@ -71,6 +71,30 @@ pub struct SendFiberOutgoingPaymentExecutor {
     fee_limit: OutgoingFeeLimit,
 }
 
+impl SendFiberOutgoingPaymentExecutor {
+    /// Constructor for reuse by swap (Fiber-to-Fiber) dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        payment_hash: Hash256,
+        cch_actor_ref: ActorRef<CchMessage>,
+        fiber_agent_ref: CchFiberAgentRef,
+        outgoing_pay_req: String,
+        retry_count: u32,
+        tlc_expiry_limit: u64,
+        fee_limit: OutgoingFeeLimit,
+    ) -> Self {
+        Self {
+            payment_hash,
+            cch_actor_ref,
+            fiber_agent_ref,
+            outgoing_pay_req,
+            retry_count,
+            tlc_expiry_limit,
+            fee_limit,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ActionExecutor for SendFiberOutgoingPaymentExecutor {
     async fn execute(self: Box<Self>) -> Result<()> {
