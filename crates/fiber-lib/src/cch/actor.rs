@@ -22,15 +22,17 @@ use crate::cch::trackers::{
     CchTrackingEvent, LndConnectionInfo, LndTrackerActor, LndTrackerArgs, LndTrackerMessage,
     RedactedCchTrackingEvent,
 };
-use crate::cch::{CchConfig, CchError, CchOrderStore, CchStoreError};
+use crate::cch::{CchConfig, CchError, CchOrderStore, CchStoreError, SwapOrderStore};
 use crate::ckb::contracts::{get_script_by_contract, Contract};
+use ckb_types::prelude::Entity;
+use crate::fiber::gossip::GossipMessageStore;
 use crate::fiber::NetworkActorMessage;
 use crate::invoice::{CkbInvoice, CkbInvoiceStatus, Currency, InvoiceBuilder};
 use crate::now_timestamp_as_millis_u64;
 use crate::store::store_impl::StoreChange;
 use crate::time::Duration;
 use fiber_types::{AttemptStatus, CchInvoice, CchOrder, CchOrderStatus, HashAlgorithm};
-use fiber_types::{Hash256, Privkey};
+use fiber_types::{Hash256, Privkey, SwapOrder, SwapOrderError};
 
 pub const ACTION_RETRY_BASE_MILLIS: u64 = 1000; // 1 second initial delay
 pub const ACTION_RETRY_MAX_MILLIS: u64 = 600_000; // 10 minute max delay
@@ -56,9 +58,17 @@ pub struct ReceiveBTC {
     pub fiber_pay_req: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExecuteSwap {
+    pub ad_hash: Hash256,
+    pub base_amount: u128,
+    pub quote_pay_req: String,
+}
+
 pub enum CchMessage {
     SendBTC(SendBTC, RpcReplyPort<Result<CchOrder, CchError>>),
     ReceiveBTC(ReceiveBTC, RpcReplyPort<Result<CchOrder, CchError>>),
+    ExecuteSwap(ExecuteSwap, RpcReplyPort<Result<SwapOrder, CchError>>),
 
     GetCchOrder(Hash256, RpcReplyPort<Result<CchOrder, CchError>>),
 
@@ -131,7 +141,9 @@ pub struct CchState<S> {
 }
 
 #[async_trait::async_trait]
-impl<S: CchOrderStore + Send + Sync + Clone + 'static> Actor for CchActor<S> {
+impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clone + 'static>
+    Actor for CchActor<S>
+{
     type Msg = CchMessage;
     type State = CchState<S>;
     type Arguments = CchArgs<S>;
@@ -332,6 +344,24 @@ impl<S: CchOrderStore + Send + Sync + Clone + 'static> Actor for CchActor<S> {
                 }
                 Ok(())
             }
+            CchMessage::ExecuteSwap(req, port) => {
+                let result = state.execute_swap(req).await;
+                if let Ok(order) = &result {
+                    // Expiry job only; leg tracking/dispatch lands in S3b.
+                    // Scheduler keys are payment hashes, so swap orders reuse
+                    // the same expiry/prune jobs as CCH orders.
+                    let _ = state.scheduler.send_message(SchedulerMessage::ScheduleExpiry {
+                        payment_hash: order.payment_hash,
+                        created_at: order.created_at,
+                        expiry_delta_seconds: order.expiry_delta_seconds,
+                    });
+                }
+                if !port.is_closed() {
+                    // ignore error
+                    let _ = port.send(result);
+                }
+                Ok(())
+            }
             CchMessage::GetCchOrder(payment_hash, port) => {
                 let result = state.store.get_cch_order(&payment_hash).map_err(Into::into);
                 if !port.is_closed() {
@@ -443,7 +473,7 @@ fn expected_ln_currency(currency: Currency) -> LnCurrency {
     }
 }
 
-impl<S: CchOrderStore> CchState<S> {
+impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore> CchState<S> {
     /// Get a CCH order by payment hash, returning None if not found.
     /// This handles the common pattern of checking for NotFound vs other errors.
     fn get_order_or_none(&self, payment_hash: &Hash256) -> Result<Option<CchOrder>, CchError> {
@@ -534,6 +564,117 @@ impl<S: CchOrderStore> CchState<S> {
         })?;
 
         Ok(get_script_by_contract(Contract::SimpleUDT, &args).into())
+    }
+
+    /// Execute a Fiber-to-Fiber swap against a live swap advertisement.
+    ///
+    /// Mirrors [`CchState::send_btc`] with both legs on Fiber: the user's
+    /// quote invoice (which holds the preimage) is validated against the
+    /// ad's rate math, then the hub creates the base invoice with the same
+    /// payment hash and returns the stored [`SwapOrder`] for the user to pay.
+    /// Atomicity follows the same reveal pattern as CCH: the user pays base
+    /// first, the hub pays quote second, preimage revelation settles both.
+    async fn execute_swap(&self, req: ExecuteSwap) -> Result<SwapOrder, CchError> {
+        let order_created_at = now_timestamp_as_millis_u64() / 1000;
+        let now_ms = now_timestamp_as_millis_u64();
+
+        // Resolve the live advertisement; expired or unknown ads are rejected.
+        let (_ad_ts, ad) = self
+            .store
+            .get_latest_swap_advertisement(&req.ad_hash)
+            .filter(|(_, ad)| !ad.is_expired(now_ms))
+            .ok_or(CchError::SwapAdNotFound(req.ad_hash))?;
+
+        // `from_str` requires a valid signature, so parsing also guarantees
+        // the user's quote invoice is signed.
+        let quote_invoice = CkbInvoice::from_str(&req.quote_pay_req)?;
+        if quote_invoice.currency != self.currency {
+            return Err(CchError::CKBInvoiceNetworkMismatch {
+                expected: self.currency,
+                actual: quote_invoice.currency,
+            });
+        }
+        if quote_invoice.hash_algorithm() != Some(&HashAlgorithm::Sha256) {
+            return Err(CchError::CKBInvoiceIncompatibleHashAlgorithm);
+        }
+        let payment_hash = *quote_invoice.payment_hash();
+
+        // Pair match: when both sides name scripts, they must agree.
+        if let (Some(quote_script), Some(invoice_script)) =
+            (&ad.quote_udt_script, quote_invoice.udt_type_script())
+        {
+            if invoice_script.as_slice() != quote_script.as_slice() {
+                return Err(CchError::SwapPairMismatch);
+            }
+        }
+
+        // Rate math is frozen here; any drift between asked and computed fails.
+        let asked = quote_invoice.amount().ok_or(CchError::CKBInvoiceMissingAmount)?;
+        let expected = req
+            .base_amount
+            .checked_mul(ad.rate)
+            .and_then(|v| v.checked_div(100_000_000))
+            .ok_or_else(|| {
+                CchError::SwapOrderError(SwapOrderError::QuoteOverflow(req.base_amount, ad.rate))
+            })?;
+        if asked != expected {
+            return Err(CchError::SwapRateMismatch { asked, expected });
+        }
+
+        // Outgoing (quote) leg must fit in half the incoming (base) leg time.
+        let quote_final_ms = quote_invoice
+            .final_tlc_minimum_expiry_delta()
+            .copied()
+            .unwrap_or(0);
+        let base_final_ms = self
+            .config
+            .ckb_final_tlc_expiry_delta_seconds
+            .checked_mul(1000)
+            .ok_or_else(|| {
+                CchError::ConfigError(format!(
+                    "ckb_final_tlc_expiry_delta_seconds ({}) overflows milliseconds",
+                    self.config.ckb_final_tlc_expiry_delta_seconds
+                ))
+            })?;
+        if quote_final_ms >= base_final_ms / 2 {
+            return Err(CchError::CKBInvoiceFinalTlcExpiryDeltaTooLarge);
+        }
+
+        let mut invoice_builder = InvoiceBuilder::new(self.currency)
+            .amount(Some(req.base_amount))
+            .payment_hash(payment_hash)
+            .hash_algorithm(HashAlgorithm::Sha256)
+            .expiry_time(Duration::from_secs(self.config.order_expiry_delta_seconds))
+            .final_expiry_delta(base_final_ms);
+        if let Some(base_script) = ad.base_udt_script.clone() {
+            invoice_builder = invoice_builder.udt_type_script(base_script);
+        }
+        let invoice = if let Some((public_key, secret_key)) = &self.node_keypair {
+            invoice_builder
+                .payee_pub_key(*public_key)
+                .build_with_sign(|hash| SECP256K1.sign_ecdsa_recoverable(hash, secret_key))
+        } else {
+            invoice_builder.build()
+        }?;
+
+        let invoice = self.fiber_agent_ref.call_add_invoice(invoice).await?;
+
+        let order = SwapOrder::new(
+            order_created_at,
+            self.config.order_expiry_delta_seconds,
+            req.ad_hash,
+            ad.base_udt_script.clone(),
+            ad.quote_udt_script.clone(),
+            ad.rate,
+            ad.fee_rate,
+            req.base_amount,
+            payment_hash,
+            invoice,
+            req.quote_pay_req,
+        )?;
+
+        self.store.insert_swap_order(order.clone())?;
+        Ok(order)
     }
 
     async fn send_btc(&self, send_btc: SendBTC) -> Result<CchOrder, CchError> {

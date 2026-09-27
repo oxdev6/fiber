@@ -83,6 +83,14 @@ pub enum CchError {
     LndRpcError(String),
     #[error("Fiber node error: {0}")]
     FiberNodeError(anyhow::Error),
+    #[error("Swap advertisement not found or expired: {0:?}")]
+    SwapAdNotFound(Hash256),
+    #[error("Swap quote amount mismatch: invoice asks {asked}, ad rate gives {expected}")]
+    SwapRateMismatch { asked: u128, expected: u128 },
+    #[error("Swap pair mismatch with advertisement")]
+    SwapPairMismatch,
+    #[error("Swap order build error: {0}")]
+    SwapOrderError(#[from] fiber_types::SwapOrderError),
 }
 
 pub type CchResult<T> = std::result::Result<T, CchError>;
