@@ -89,3 +89,49 @@ pub struct ListSwapAdsResult {
 pub struct GetBestSwapRateResult {
     pub offer: Option<SwapOffer>,
 }
+
+/// Parameters for executing a swap against a live advertisement.
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExecuteSwapParams {
+    /// Hash of the swap advertisement to execute (from list output).
+    pub ad_hash: Hash256,
+    /// Base-asset units the user will pay.
+    #[serde_as(as = "U128Hex")]
+    #[schemars(schema_with = "crate::schema_helpers::schema_as_uint_hex")]
+    pub base_amount: u128,
+    /// User's quote-asset invoice (holds the preimage) as a string.
+    pub quote_pay_req: String,
+}
+
+/// A Fiber-to-Fiber swap order.
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SwapOrderResponse {
+    /// Payment hash linking both legs (also the order id).
+    pub payment_hash: Hash256,
+    /// Advertisement hash this order executes.
+    pub ad_hash: Hash256,
+    /// Hub's base-asset invoice for the user to pay, as a string.
+    pub base_pay_req: String,
+    /// User's quote-asset invoice the hub pays, as given.
+    pub quote_pay_req: String,
+    /// Base units in.
+    #[serde_as(as = "U128Hex")]
+    #[schemars(schema_with = "crate::schema_helpers::schema_as_uint_hex")]
+    pub base_amount: u128,
+    /// Quote units out (frozen at creation).
+    #[serde_as(as = "U128Hex")]
+    #[schemars(schema_with = "crate::schema_helpers::schema_as_uint_hex")]
+    pub quote_amount: u128,
+    /// Frozen rate (quote per base × 1e8).
+    #[serde_as(as = "U128Hex")]
+    #[schemars(schema_with = "crate::schema_helpers::schema_as_uint_hex")]
+    pub rate: u128,
+    /// Order status.
+    pub status: crate::cch::CchOrderStatus,
+    /// Seconds since epoch when created.
+    #[serde_as(as = "U64Hex")]
+    #[schemars(schema_with = "crate::schema_helpers::schema_as_uint_hex")]
+    pub created_at: u64,
+}

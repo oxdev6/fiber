@@ -327,6 +327,22 @@ mod cch_conversions {
             }
         }
     }
+
+    impl From<fiber_types::SwapOrder> for crate::swap_ad::SwapOrderResponse {
+        fn from(order: fiber_types::SwapOrder) -> Self {
+            crate::swap_ad::SwapOrderResponse {
+                payment_hash: order.payment_hash.into(),
+                ad_hash: order.ad_hash.into(),
+                base_pay_req: order.base_invoice.to_string(),
+                quote_pay_req: order.quote_pay_req,
+                base_amount: order.base_amount,
+                quote_amount: order.quote_amount,
+                rate: order.rate,
+                status: order.status.into(),
+                created_at: order.created_at,
+            }
+        }
+    }
 }
 
 impl From<fiber_types::UdtCfgInfos> for JsonUdtCfgInfos {

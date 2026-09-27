@@ -3,7 +3,11 @@ use crate::rpc::utils::RpcResultExt;
 use jsonrpsee::{proc_macros::rpc, types::ErrorObjectOwned};
 use ractor::{call_t, ActorRef};
 
-pub use fiber_json_types::{CchOrderResponse, GetCchOrderParams, ReceiveBTCParams, SendBTCParams};
+pub use fiber_json_types::{
+    CchOrderResponse, GetCchOrderParams, ReceiveBTCParams, SendBTCParams,
+};
+use crate::cch::ExecuteSwap;
+pub use fiber_json_types::swap_ad::{ExecuteSwapParams, SwapOrderResponse};
 
 /// RPC module for cross chain hub demonstration.
 #[rpc(server)]
@@ -25,6 +29,13 @@ trait CchRpc {
         &self,
         params: GetCchOrderParams,
     ) -> Result<CchOrderResponse, ErrorObjectOwned>;
+
+    /// Executes a Fiber-to-Fiber swap against a live swap advertisement.
+    #[method(name = "execute_swap")]
+    async fn execute_swap(
+        &self,
+        params: ExecuteSwapParams,
+    ) -> Result<SwapOrderResponse, ErrorObjectOwned>;
 }
 
 pub struct CchRpcServerImpl {
@@ -60,6 +71,14 @@ impl CchRpcServer for CchRpcServerImpl {
         params: GetCchOrderParams,
     ) -> Result<CchOrderResponse, ErrorObjectOwned> {
         self.get_cch_order(params).await
+    }
+
+    /// Execute a Fiber-to-Fiber swap against a live swap advertisement.
+    async fn execute_swap(
+        &self,
+        params: ExecuteSwapParams,
+    ) -> Result<SwapOrderResponse, ErrorObjectOwned> {
+        self.execute_swap(params).await
     }
 }
 
@@ -112,5 +131,24 @@ impl CchRpcServerImpl {
         .rpc_err()?;
 
         result.map(CchOrderResponse::from).map_err(Into::into)
+    }
+
+    async fn execute_swap(
+        &self,
+        params: ExecuteSwapParams,
+    ) -> Result<SwapOrderResponse, ErrorObjectOwned> {
+        let result = call_t!(
+            self.cch_actor,
+            CchMessage::ExecuteSwap,
+            TIMEOUT,
+            ExecuteSwap {
+                ad_hash: params.ad_hash.into(),
+                base_amount: params.base_amount,
+                quote_pay_req: params.quote_pay_req,
+            }
+        )
+        .rpc_err()?;
+
+        result.map(SwapOrderResponse::from).map_err(Into::into)
     }
 }
