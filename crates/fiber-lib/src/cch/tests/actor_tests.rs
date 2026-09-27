@@ -2366,3 +2366,134 @@ async fn test_send_btc_passes_sufficient_expiry_delta() {
         order.failure_reason,
     );
 }
+
+/// Build a signed user quote invoice for swap tests (amount + expiry + hash algo set).
+fn create_test_swap_quote_invoice(
+    payment_hash: Hash256,
+    amount: u128,
+    final_expiry_ms: u64,
+) -> CkbInvoice {
+    use fiber_types::HashAlgorithm;
+    let private_key = SecretKey::from_slice(&[43u8; 32]).unwrap();
+    let public_key = secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &private_key);
+    let mut invoice = CkbInvoice {
+        currency: Currency::Fibb,
+        amount: Some(amount),
+        signature: None,
+        data: InvoiceData {
+            payment_hash,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            attrs: vec![
+                Attribute::FinalHtlcMinimumExpiryDelta(final_expiry_ms),
+                Attribute::Description("swap-quote".to_string()),
+                Attribute::ExpiryTime(Duration::from_secs(3600)),
+                Attribute::PayeePublicKey(public_key),
+                Attribute::HashAlgorithm(HashAlgorithm::Sha256),
+            ],
+        },
+    };
+    invoice
+        .update_signature(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+        .unwrap();
+    invoice
+}
+
+/// Seed a signed swap advertisement directly into the mock gossip store.
+fn seed_test_swap_ad(rate: u128) -> (fiber_types::SwapAdvertisement, Hash256) {
+    use fiber_types::{Privkey, SwapAdvertisement};
+    let op_key = Privkey::from_slice(&[99u8; 32]);
+    let now = crate::now_timestamp_as_millis_u64();
+    let ad = SwapAdvertisement::new_signed(
+        Hash256::default(),
+        None,
+        None,
+        rate,
+        3_000,
+        &op_key,
+        now,
+        now + 86_400_000,
+    );
+    assert!(ad.verify());
+    let hash = Hash256::from(ckb_hash::blake2b_256(ad.message_to_sign()));
+    (ad, hash)
+}
+
+async fn wait_for_swap_status(
+    store: &MockCchOrderStore,
+    payment_hash: Hash256,
+    expected: CchOrderStatus,
+    timeout_ms: u64,
+) -> fiber_types::SwapOrder {
+    use crate::cch::SwapOrderStore;
+    let start = std::time::Instant::now();
+    let timeout = tokio::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Ok(order) = store.get_swap_order(&payment_hash) {
+            if order.status == expected {
+                return order;
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "timed out waiting for swap order {:x} to reach {:?}",
+                payment_hash, expected
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_execute_swap_full_lifecycle_through_actor() {
+    use crate::cch::ExecuteSwap;
+    use crate::fiber::gossip::GossipMessageStore;
+
+    let (preimage, payment_hash) = create_valid_preimage_pair(77);
+    let store = MockCchOrderStore::new();
+    let harness = setup_test_harness_with_store(store.clone()).await;
+
+    // 1. Seed a live ad: rate 100.0, base 100 units -> quote 10_000 units.
+    let rate = 10_000_000_000u128;
+    let (ad, ad_hash) = seed_test_swap_ad(rate);
+    store.save_swap_advertisement(ad);
+
+    // 2. User's quote invoice asks exactly the rate-math amount.
+    let quote_invoice = create_test_swap_quote_invoice(payment_hash, 10_000, 3_600_000);
+
+    // 3. ExecuteSwap creates a Pending order and returns the base invoice.
+    let order: fiber_types::SwapOrder = ractor::call!(
+        harness.actor,
+        CchMessage::ExecuteSwap,
+        ExecuteSwap {
+            ad_hash,
+            base_amount: 100,
+            quote_pay_req: quote_invoice.to_string(),
+        }
+    )
+    .expect("actor call failed")
+    .expect("execute_swap failed");
+    assert_eq!(order.status, CchOrderStatus::Pending);
+    assert_eq!(order.payment_hash, payment_hash);
+    assert_eq!(order.quote_amount, 10_000);
+
+    // 4. User pays the base invoice -> hub dispatches the quote payment.
+    // NOTE: intermediate states move in microseconds in-process, so wait for
+    // OutgoingInFlight (proof the quote payment was actually sent), not the
+    // transient IncomingAccepted.
+    harness.simulate_incoming_invoice_received(payment_hash);
+    let _order =
+        wait_for_swap_status(&store, payment_hash, CchOrderStatus::OutgoingInFlight, 1000).await;
+    assert!(harness.was_fiber_payment_sent(payment_hash));
+
+    // 5. Quote leg settles with preimage -> base leg settles -> Success.
+    // (The mock settle handler auto-injects the Paid event, like production.)
+    harness.simulate_fiber_payment_success(payment_hash, preimage);
+    let order =
+        wait_for_swap_status(&store, payment_hash, CchOrderStatus::Success, 2000).await;
+    assert_eq!(order.payment_preimage, Some(preimage));
+    assert!(order.failure_reason.is_none());
+    assert!(order.is_final());
+}
