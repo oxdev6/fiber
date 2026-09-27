@@ -22,7 +22,10 @@ use crate::cch::trackers::{
     CchTrackingEvent, LndConnectionInfo, LndTrackerActor, LndTrackerArgs, LndTrackerMessage,
     RedactedCchTrackingEvent,
 };
-use crate::cch::{CchConfig, CchError, CchOrderStore, CchStoreError, SwapOrderStore};
+use crate::cch::{
+    actions::swap_actions::{execute_swap_action, swap_on_entering, SwapOrderAction},
+    CchConfig, CchError, CchOrderStore, CchStoreError, SwapOrderStore,
+};
 use crate::ckb::contracts::{get_script_by_contract, Contract};
 use ckb_types::prelude::Entity;
 use crate::fiber::gossip::GossipMessageStore;
@@ -69,6 +72,11 @@ pub enum CchMessage {
     SendBTC(SendBTC, RpcReplyPort<Result<CchOrder, CchError>>),
     ReceiveBTC(ReceiveBTC, RpcReplyPort<Result<CchOrder, CchError>>),
     ExecuteSwap(ExecuteSwap, RpcReplyPort<Result<SwapOrder, CchError>>),
+    ExecuteSwapAction {
+        payment_hash: Hash256,
+        action: SwapOrderAction,
+        retry_count: u32,
+    },
 
     GetCchOrder(Hash256, RpcReplyPort<Result<CchOrder, CchError>>),
 
@@ -373,17 +381,33 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
             CchMessage::TrackingEvent(event) => {
                 tracing::debug!("tracking event {:?}", RedactedCchTrackingEvent(&event));
                 let payment_hash = *event.payment_hash();
-                match state.handle_tracking_event(event).await {
-                    Ok(actions) => {
-                        append_actions(myself, payment_hash, actions)?;
+                // Stores are prefix-separated: a hash hits at most one side.
+                if state.get_active_order_or_none(&payment_hash)?.is_some() {
+                    match state.handle_tracking_event(event).await {
+                        Ok(actions) => {
+                            append_actions(myself, payment_hash, actions)?;
+                        }
+                        Err(err) => {
+                            // Ignore errors because events come from external systems
+                            tracing::error!(
+                                "handle_tracking_event for payment hash {:x} failed: {}",
+                                payment_hash,
+                                err
+                            );
+                        }
                     }
-                    Err(err) => {
-                        // Ignore errors because events come from external systems
-                        tracing::error!(
-                            "handle_tracking_event for payment hash {:x} failed: {}",
-                            payment_hash,
-                            err
-                        );
+                } else {
+                    match state.handle_swap_tracking_event(event).await {
+                        Ok(actions) => {
+                            append_swap_actions(myself, payment_hash, actions)?;
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                "handle_swap_tracking_event for payment hash {:x} failed: {}",
+                                payment_hash,
+                                err
+                            );
+                        }
                     }
                 }
                 Ok(())
@@ -399,16 +423,31 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
                 let events = state.map_store_change_to_events(&change);
                 for event in events {
                     let payment_hash = *event.payment_hash();
-                    match state.handle_tracking_event(event).await {
-                        Ok(actions) => {
-                            append_actions(myself.clone(), payment_hash, actions)?;
+                    if state.get_active_order_or_none(&payment_hash)?.is_some() {
+                        match state.handle_tracking_event(event).await {
+                            Ok(actions) => {
+                                append_actions(myself.clone(), payment_hash, actions)?;
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "handle_tracking_event for payment hash {:x} failed: {}",
+                                    payment_hash,
+                                    err
+                                );
+                            }
                         }
-                        Err(err) => {
-                            tracing::error!(
-                                "handle_tracking_event for payment hash {:x} failed: {}",
-                                payment_hash,
-                                err
-                            );
+                    } else {
+                        match state.handle_swap_tracking_event(event).await {
+                            Ok(actions) => {
+                                append_swap_actions(myself.clone(), payment_hash, actions)?;
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "handle_swap_tracking_event for payment hash {:x} failed: {}",
+                                    payment_hash,
+                                    err
+                                );
+                            }
                         }
                     }
                 }
@@ -439,6 +478,35 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
                     ActionDispatcher::execute(state, &myself, &order, action, retry_count).await
                 {
                     schedule_action_retry(
+                        &myself,
+                        payment_hash,
+                        action,
+                        retry_count,
+                        &err.to_string(),
+                    );
+                }
+                Ok(())
+            }
+            CchMessage::ExecuteSwapAction {
+                payment_hash,
+                action,
+                retry_count,
+            } => {
+                let order = match state.get_active_swap_order_or_none(&payment_hash)? {
+                    None => return Ok(()),
+                    Some(order) => order,
+                };
+                if let Err(err) = execute_swap_action(
+                    state.fiber_agent_ref.clone(),
+                    myself.clone(),
+                    &order,
+                    action,
+                    retry_count,
+                    state.config.ckb_final_tlc_expiry_delta_seconds,
+                )
+                .await
+                {
+                    schedule_swap_action_retry(
                         &myself,
                         payment_hash,
                         action,
@@ -492,6 +560,85 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore> CchState<S> {
         Ok(self
             .get_order_or_none(payment_hash)?
             .filter(|order| !order.is_final()))
+    }
+
+    fn get_active_swap_order_or_none(
+        &self,
+        payment_hash: &Hash256,
+    ) -> Result<Option<SwapOrder>, CchError> {
+        match self.store.get_swap_order(payment_hash) {
+            Err(CchStoreError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err.into()),
+            Ok(order) => Ok((!order.is_final()).then_some(order)),
+        }
+    }
+
+    fn schedule_swap_job(&self, order: &SwapOrder) {
+        let msg = if order.is_final() {
+            SchedulerMessage::SchedulePrune {
+                payment_hash: order.payment_hash,
+                created_at: order.created_at,
+                expiry_delta_seconds: order.expiry_delta_seconds,
+            }
+        } else {
+            SchedulerMessage::ScheduleExpiry {
+                payment_hash: order.payment_hash,
+                created_at: order.created_at,
+                expiry_delta_seconds: order.expiry_delta_seconds,
+            }
+        };
+        if let Err(err) = self.scheduler.send_message(msg) {
+            tracing::error!(
+                "Failed to schedule job for swap order {:x}: {}",
+                order.payment_hash,
+                err
+            );
+        }
+    }
+
+    /// Mirror of [`CchState::handle_tracking_event`] for swap orders.
+    ///
+    /// Stores are prefix-separated, so a payment hash hits at most one side;
+    /// callers must route to CCH first and fall through here only on miss.
+    async fn handle_swap_tracking_event(
+        &self,
+        event: CchTrackingEvent,
+    ) -> Result<Vec<SwapOrderAction>> {
+        use crate::cch::order::CchOrderStateMachine;
+
+        let mut order = match self.get_active_swap_order_or_none(event.payment_hash())? {
+            None => return Ok(vec![]),
+            Some(order) => order,
+        };
+
+        if order.status == CchOrderStatus::Pending
+            && matches!(
+                &event,
+                CchTrackingEvent::InvoiceChanged {
+                    status: CkbInvoiceStatus::Received,
+                    ..
+                }
+            )
+        {
+            let current_time = now_timestamp_as_millis_u64() / 1000;
+            if order.update_if_expired(current_time) {
+                self.store.update_swap_order(order.clone());
+                self.schedule_swap_job(&order);
+                tracing::info!(
+                    "Rejected incoming invoice event for expired pending swap order {:x}",
+                    order.payment_hash
+                );
+                return Ok(vec![]);
+            }
+        }
+
+        if CchOrderStateMachine::apply_to(&mut order, event.into())?.is_some() {
+            self.store.update_swap_order(order.clone());
+            self.schedule_swap_job(&order);
+            Ok(swap_on_entering(&order))
+        } else {
+            Ok(vec![])
+        }
     }
 
     fn schedule_job_for_non_final_order(&self, order: &CchOrder) {
@@ -1050,6 +1197,44 @@ fn append_actions(
         })?;
     }
     Ok(())
+}
+
+fn append_swap_actions(
+    myself: ActorRef<CchMessage>,
+    payment_hash: Hash256,
+    actions: Vec<SwapOrderAction>,
+) -> Result<(), ActorProcessingErr> {
+    for action in actions {
+        myself.send_message(CchMessage::ExecuteSwapAction {
+            payment_hash,
+            action,
+            retry_count: 0,
+        })?;
+    }
+    Ok(())
+}
+
+fn schedule_swap_action_retry(
+    myself: &ActorRef<CchMessage>,
+    payment_hash: Hash256,
+    action: SwapOrderAction,
+    retry_count: u32,
+    reason: &str,
+) {
+    let delay = calculate_retry_delay(retry_count);
+    tracing::error!(
+        "swap action {:?} for payment hash {:x} failed (retry {}): {}. Retrying in {:?}",
+        action,
+        payment_hash,
+        retry_count,
+        reason,
+        delay
+    );
+    myself.send_after(delay, move || CchMessage::ExecuteSwapAction {
+        payment_hash,
+        action,
+        retry_count,
+    });
 }
 
 fn schedule_action_retry(
