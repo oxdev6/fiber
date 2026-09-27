@@ -47,6 +47,8 @@ const BTC_BLOCK_TIME_SECS: u64 = BTC_BLOCK_TIME_MILLIS / 1_000;
 #[derive(Clone, Default)]
 pub struct MockCchOrderStore {
     orders: Arc<Mutex<HashMap<Hash256, CchOrder>>>,
+    swap_orders: Arc<Mutex<HashMap<Hash256, fiber_types::SwapOrder>>>,
+    broadcasts: Arc<Mutex<Vec<crate::fiber::types::BroadcastMessageWithTimestamp>>>,
 }
 
 impl MockCchOrderStore {
@@ -92,6 +94,191 @@ impl CchOrderStore for MockCchOrderStore {
         let mut orders = self.orders.lock().unwrap();
         orders.remove(payment_hash);
     }
+}
+
+impl crate::cch::SwapOrderStore for MockCchOrderStore {
+    fn get_swap_order(
+        &self,
+        payment_hash: &Hash256,
+    ) -> Result<fiber_types::SwapOrder, CchStoreError> {
+        self.swap_orders
+            .lock()
+            .unwrap()
+            .get(payment_hash)
+            .ok_or(CchStoreError::NotFound(*payment_hash))
+            .cloned()
+    }
+
+    fn insert_swap_order(&self, order: fiber_types::SwapOrder) -> Result<(), CchStoreError> {
+        let mut orders = self.swap_orders.lock().unwrap();
+        let payment_hash = order.payment_hash;
+        match orders.insert(payment_hash, order) {
+            Some(_) => Err(CchStoreError::Duplicated(payment_hash)),
+            None => Ok(()),
+        }
+    }
+
+    fn update_swap_order(&self, order: fiber_types::SwapOrder) {
+        let mut orders = self.swap_orders.lock().unwrap();
+        orders.insert(order.payment_hash, order);
+    }
+
+    fn get_swap_order_keys_iter(&self) -> impl IntoIterator<Item = Hash256> {
+        self.swap_orders
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+    }
+
+    fn delete_swap_order(&self, payment_hash: &Hash256) {
+        let mut orders = self.swap_orders.lock().unwrap();
+        orders.remove(payment_hash);
+    }
+}
+
+impl crate::fiber::gossip::GossipMessageStore for MockCchOrderStore {
+    fn get_broadcast_messages(
+        &self,
+        after_cursor: &fiber_types::Cursor,
+        limit: usize,
+    ) -> Vec<crate::fiber::types::BroadcastMessageWithTimestamp> {
+        let mut msgs: Vec<_> = self
+            .broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| &m.cursor() > after_cursor)
+            .cloned()
+            .collect();
+        msgs.sort_by(|a, b| a.cursor().cmp(&b.cursor()));
+        if limit == 0 {
+            msgs
+        } else {
+            msgs.into_iter().take(limit).collect()
+        }
+    }
+
+    fn get_broadcast_messages_reverse(
+        &self,
+        before_cursor: Option<&fiber_types::Cursor>,
+        limit: usize,
+    ) -> Vec<crate::fiber::types::BroadcastMessageWithTimestamp> {
+        let mut msgs: Vec<_> = self
+            .broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| before_cursor.map(|c| &m.cursor() < c).unwrap_or(true))
+            .cloned()
+            .collect();
+        msgs.sort_by(|a, b| b.cursor().cmp(&a.cursor()));
+        if limit == 0 {
+            msgs
+        } else {
+            msgs.into_iter().take(limit).collect()
+        }
+    }
+
+    fn get_broadcast_message_with_cursor(
+        &self,
+        cursor: &fiber_types::Cursor,
+    ) -> Option<crate::fiber::types::BroadcastMessageWithTimestamp> {
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| &m.cursor() == cursor)
+            .cloned()
+    }
+
+    fn get_latest_broadcast_message_cursor(&self) -> Option<fiber_types::Cursor> {
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.cursor())
+            .max()
+    }
+
+    fn get_latest_channel_announcement_timestamp(
+        &self,
+        _outpoint: &ckb_types::packed::OutPoint,
+    ) -> Option<u64> {
+        None
+    }
+
+    fn get_latest_channel_update_timestamp(
+        &self,
+        _outpoint: &ckb_types::packed::OutPoint,
+        _is_node1: bool,
+    ) -> Option<u64> {
+        None
+    }
+
+    fn get_latest_node_announcement_timestamp(
+        &self,
+        _pk: &fiber_types::Pubkey,
+    ) -> Option<u64> {
+        None
+    }
+
+    fn delete_broadcast_message(&self, cursor: &fiber_types::Cursor) {
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .retain(|m| &m.cursor() != cursor);
+    }
+
+    fn save_channel_announcement(
+        &self,
+        timestamp: u64,
+        channel_announcement: fiber_types::ChannelAnnouncement,
+    ) {
+        self.broadcasts.lock().unwrap().push(
+            crate::fiber::types::BroadcastMessageWithTimestamp::ChannelAnnouncement(timestamp, channel_announcement),
+        );
+    }
+
+    fn save_channel_update(&self, channel_update: fiber_types::ChannelUpdate) {
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .push(crate::fiber::types::BroadcastMessageWithTimestamp::ChannelUpdate(channel_update));
+    }
+
+    fn save_node_announcement(&self, node_announcement: fiber_types::NodeAnnouncement) {
+        self.broadcasts.lock().unwrap().push(
+            crate::fiber::types::BroadcastMessageWithTimestamp::NodeAnnouncement(node_announcement),
+        );
+    }
+
+    fn save_swap_advertisement(&self, swap_advertisement: fiber_types::SwapAdvertisement) {
+        self.broadcasts.lock().unwrap().push(
+            crate::fiber::types::BroadcastMessageWithTimestamp::SwapAdvertisement(swap_advertisement),
+        );
+    }
+
+    fn get_latest_swap_advertisement_timestamp(&self, hash: &Hash256) -> Option<u64> {
+        self.broadcasts.lock().unwrap().iter().find_map(|m| match m {
+            crate::fiber::types::BroadcastMessageWithTimestamp::SwapAdvertisement(ad) => {
+                let h = ckb_hash::blake2b_256(ad.message_to_sign());
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h[..32]);
+                (*hash == Hash256::from(arr)).then_some(ad.timestamp)
+            }
+            _ => None,
+        })
+    }
+
+    fn get_channel_timestamps_iter(
+        &self,
+    ) -> impl IntoIterator<Item = (ckb_types::packed::OutPoint, [u64; 3])> {
+        Vec::new()
+    }
+
+    fn delete_channel_timestamps(&self, _outpoint: &ckb_types::packed::OutPoint) {}
 }
 
 /// Helper function to create a test payment hash
