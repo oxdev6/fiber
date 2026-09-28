@@ -73,8 +73,10 @@ fn packed_to_json_script(s: Script) -> ckb_jsonrpc_types::Script {
 }
 
 fn ad_to_offer(ad: SwapAdvertisement) -> SwapOffer {
+    use crate::fiber::swap_advertisement::swap_ad_hash;
     let now = crate::now_timestamp_as_millis_u64();
     SwapOffer {
+        ad_hash: swap_ad_hash(&ad).into(),
         base_udt_script: ad.base_udt_script.clone().map(|s| s.into()),
         quote_udt_script: ad.quote_udt_script.clone().map(|s| s.into()),
         rate: ad.rate,

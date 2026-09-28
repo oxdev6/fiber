@@ -33,10 +33,21 @@ impl AssetPairFilter {
     }
 }
 
+/// Canonical content hash identifying an advertisement.
+/// Matches the `BroadcastMessageID::SwapAdvertisement` used by the store.
+pub fn swap_ad_hash(ad: &SwapAdvertisement) -> Hash256 {
+    let h = ckb_hash::blake2b_256(ad.message_to_sign());
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&h[..32]);
+    Hash256::from(arr)
+}
+
 /// View type for RPC (hex for scripts, string for rate).
 #[serde_as]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapOfferView {
+    /// Content hash — pass back as `ad_hash` to execute this offer.
+    pub ad_hash: Hash256,
     #[serde_as(as = "Option<EntityHex>")]
     pub base_udt_script: Option<Script>,
     #[serde_as(as = "Option<EntityHex>")]
@@ -56,6 +67,7 @@ impl From<SwapAdvertisement> for SwapOfferView {
     fn from(ad: SwapAdvertisement) -> Self {
         let now = crate::now_timestamp_as_millis_u64();
         Self {
+            ad_hash: swap_ad_hash(&ad),
             base_udt_script: ad.base_udt_script.clone(),
             quote_udt_script: ad.quote_udt_script.clone(),
             rate: ad.rate.to_string(),

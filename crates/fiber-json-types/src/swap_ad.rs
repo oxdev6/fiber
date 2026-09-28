@@ -50,6 +50,8 @@ pub struct GetBestSwapRateParams {
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SwapOffer {
+    /// Content hash identifying the offer — pass back as `ad_hash` to execute it.
+    pub ad_hash: Hash256,
     /// Base UDT script.
     pub base_udt_script: Option<Script>,
     /// Quote UDT script.
