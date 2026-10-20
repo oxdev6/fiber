@@ -30,6 +30,13 @@ trait CchRpc {
         params: GetCchOrderParams,
     ) -> Result<CchOrderResponse, ErrorObjectOwned>;
 
+    /// Get a swap order by payment hash.
+    #[method(name = "get_swap_order")]
+    async fn get_swap_order(
+        &self,
+        params: GetCchOrderParams,
+    ) -> Result<SwapOrderResponse, ErrorObjectOwned>;
+
     /// Executes a Fiber-to-Fiber swap against a live swap advertisement.
     #[method(name = "execute_swap")]
     async fn execute_swap(
@@ -71,6 +78,14 @@ impl CchRpcServer for CchRpcServerImpl {
         params: GetCchOrderParams,
     ) -> Result<CchOrderResponse, ErrorObjectOwned> {
         self.get_cch_order(params).await
+    }
+
+    /// Get a swap order by payment hash.
+    async fn get_swap_order(
+        &self,
+        params: GetCchOrderParams,
+    ) -> Result<SwapOrderResponse, ErrorObjectOwned> {
+        self.get_swap_order(params).await
     }
 
     /// Execute a Fiber-to-Fiber swap against a live swap advertisement.
@@ -146,6 +161,22 @@ impl CchRpcServerImpl {
                 base_amount: params.base_amount,
                 quote_pay_req: params.quote_pay_req,
             }
+        )
+        .rpc_err()?;
+
+        result.map(SwapOrderResponse::from).map_err(Into::into)
+    }
+
+    async fn get_swap_order(
+        &self,
+        params: GetCchOrderParams,
+    ) -> Result<SwapOrderResponse, ErrorObjectOwned> {
+        let payment_hash = params.payment_hash.into();
+        let result = call_t!(
+            self.cch_actor,
+            CchMessage::GetSwapOrder,
+            TIMEOUT,
+            payment_hash
         )
         .rpc_err()?;
 

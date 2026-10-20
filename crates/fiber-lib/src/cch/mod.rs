@@ -1,5 +1,5 @@
 mod actor;
-pub use actor::{CchActor, CchArgs, CchMessage, ReceiveBTC, SendBTC};
+pub use actor::{CchActor, CchArgs, CchMessage, ExecuteSwap, ReceiveBTC, SendBTC};
 
 mod cch_fiber_agent;
 pub use cch_fiber_agent::{

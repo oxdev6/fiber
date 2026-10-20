@@ -79,6 +79,7 @@ pub enum CchMessage {
     },
 
     GetCchOrder(Hash256, RpcReplyPort<Result<CchOrder, CchError>>),
+    GetSwapOrder(Hash256, RpcReplyPort<Result<SwapOrder, CchError>>),
 
     TrackingEvent(CchTrackingEvent),
 
@@ -372,6 +373,17 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
             }
             CchMessage::GetCchOrder(payment_hash, port) => {
                 let result = state.store.get_cch_order(&payment_hash).map_err(Into::into);
+                if !port.is_closed() {
+                    // ignore error
+                    let _ = port.send(result);
+                }
+                Ok(())
+            }
+            CchMessage::GetSwapOrder(payment_hash, port) => {
+                let result = state
+                    .store
+                    .get_swap_order(&payment_hash)
+                    .map_err(Into::into);
                 if !port.is_closed() {
                     // ignore error
                     let _ = port.send(result);

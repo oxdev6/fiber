@@ -25,6 +25,23 @@ pub struct SettleFiberIncomingInvoiceExecutor {
     fiber_agent_ref: CchFiberAgentRef,
 }
 
+impl SettleFiberIncomingInvoiceExecutor {
+    /// Constructor for reuse by swap (Fiber-to-Fiber) settlement.
+    pub(crate) fn new(
+        payment_hash: Hash256,
+        payment_preimage: Hash256,
+        cch_actor_ref: ActorRef<CchMessage>,
+        fiber_agent_ref: CchFiberAgentRef,
+    ) -> Self {
+        Self {
+            payment_hash,
+            payment_preimage,
+            cch_actor_ref,
+            fiber_agent_ref,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ActionExecutor for SettleFiberIncomingInvoiceExecutor {
     async fn execute(self: Box<Self>) -> Result<()> {
