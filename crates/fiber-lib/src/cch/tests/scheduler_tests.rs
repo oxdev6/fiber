@@ -499,3 +499,97 @@ async fn test_expiry_schedules_prune_job() {
     assert!(order_result_after.is_err());
     assert!(order_result_after.unwrap_err() == CchStoreError::NotFound(payment_hash));
 }
+
+#[tokio::test]
+async fn test_schedule_expiry_job_for_swap_order() {
+    use crate::cch::SwapOrderStore;
+    use fiber_types::SwapOrder;
+
+    let (scheduler, store, _) = setup_scheduler().await;
+
+    let payment_hash = test_payment_hash(31);
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expiry_delta_seconds = 3600;
+    let created_at = current_time - expiry_delta_seconds - 100;
+
+    let invoice = create_test_fiber_invoice(payment_hash);
+    let order = SwapOrder::new(
+        created_at,
+        expiry_delta_seconds,
+        Hash256::default(),
+        None,
+        None,
+        1,
+        0,
+        1,
+        payment_hash,
+        invoice,
+        "fibt1test".to_string(),
+    )
+    .unwrap();
+    store.insert_swap_order(order).unwrap();
+
+    scheduler
+        .send_message(SchedulerMessage::ScheduleExpiry {
+            payment_hash,
+            created_at,
+            expiry_delta_seconds,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let order = store.get_swap_order(&payment_hash).unwrap();
+    assert_eq!(order.status, CchOrderStatus::Failed);
+    assert_eq!(order.failure_reason.as_deref(), Some("Swap order expired"));
+}
+
+#[tokio::test]
+async fn test_prune_job_deletes_final_swap_order() {
+    use crate::cch::SwapOrderStore;
+    use fiber_types::SwapOrder;
+
+    let (scheduler, store, _) = setup_scheduler().await;
+
+    let payment_hash = test_payment_hash(32);
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expiry_delta_seconds = 3600;
+    let created_at = current_time - expiry_delta_seconds - PRUNE_DELAY_SECONDS - 100;
+
+    let invoice = create_test_fiber_invoice(payment_hash);
+    let mut order = SwapOrder::new(
+        created_at,
+        expiry_delta_seconds,
+        Hash256::default(),
+        None,
+        None,
+        1,
+        0,
+        1,
+        payment_hash,
+        invoice,
+        "fibt1test".to_string(),
+    )
+    .unwrap();
+    order.status = CchOrderStatus::Success;
+    store.insert_swap_order(order).unwrap();
+
+    scheduler
+        .send_message(SchedulerMessage::SchedulePrune {
+            payment_hash,
+            created_at,
+            expiry_delta_seconds,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let result = store.get_swap_order(&payment_hash);
+    assert!(matches!(result, Err(CchStoreError::NotFound(hash)) if hash == payment_hash));
+}

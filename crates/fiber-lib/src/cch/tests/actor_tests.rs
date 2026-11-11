@@ -217,10 +217,7 @@ impl crate::fiber::gossip::GossipMessageStore for MockCchOrderStore {
         None
     }
 
-    fn get_latest_node_announcement_timestamp(
-        &self,
-        _pk: &fiber_types::Pubkey,
-    ) -> Option<u64> {
+    fn get_latest_node_announcement_timestamp(&self, _pk: &fiber_types::Pubkey) -> Option<u64> {
         None
     }
 
@@ -237,15 +234,17 @@ impl crate::fiber::gossip::GossipMessageStore for MockCchOrderStore {
         channel_announcement: fiber_types::ChannelAnnouncement,
     ) {
         self.broadcasts.lock().unwrap().push(
-            crate::fiber::types::BroadcastMessageWithTimestamp::ChannelAnnouncement(timestamp, channel_announcement),
+            crate::fiber::types::BroadcastMessageWithTimestamp::ChannelAnnouncement(
+                timestamp,
+                channel_announcement,
+            ),
         );
     }
 
     fn save_channel_update(&self, channel_update: fiber_types::ChannelUpdate) {
-        self.broadcasts
-            .lock()
-            .unwrap()
-            .push(crate::fiber::types::BroadcastMessageWithTimestamp::ChannelUpdate(channel_update));
+        self.broadcasts.lock().unwrap().push(
+            crate::fiber::types::BroadcastMessageWithTimestamp::ChannelUpdate(channel_update),
+        );
     }
 
     fn save_node_announcement(&self, node_announcement: fiber_types::NodeAnnouncement) {
@@ -256,20 +255,26 @@ impl crate::fiber::gossip::GossipMessageStore for MockCchOrderStore {
 
     fn save_swap_advertisement(&self, swap_advertisement: fiber_types::SwapAdvertisement) {
         self.broadcasts.lock().unwrap().push(
-            crate::fiber::types::BroadcastMessageWithTimestamp::SwapAdvertisement(swap_advertisement),
+            crate::fiber::types::BroadcastMessageWithTimestamp::SwapAdvertisement(
+                swap_advertisement,
+            ),
         );
     }
 
     fn get_latest_swap_advertisement_timestamp(&self, hash: &Hash256) -> Option<u64> {
-        self.broadcasts.lock().unwrap().iter().find_map(|m| match m {
-            crate::fiber::types::BroadcastMessageWithTimestamp::SwapAdvertisement(ad) => {
-                let h = ckb_hash::blake2b_256(ad.message_to_sign());
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&h[..32]);
-                (*hash == Hash256::from(arr)).then_some(ad.timestamp)
-            }
-            _ => None,
-        })
+        self.broadcasts
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| match m {
+                crate::fiber::types::BroadcastMessageWithTimestamp::SwapAdvertisement(ad) => {
+                    let h = ckb_hash::blake2b_256(ad.message_to_sign());
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&h[..32]);
+                    (*hash == Hash256::from(arr)).then_some(ad.timestamp)
+                }
+                _ => None,
+            })
     }
 
     fn get_channel_timestamps_iter(
@@ -695,6 +700,7 @@ async fn setup_test_harness_with_config_and_store(
         token: CancellationToken::new(),
         network_actor: Some(network_actor),
         node_keypair: Some(crate::fiber::KeyPair::try_from([42u8; 32].as_slice()).unwrap()),
+        swap_ad_operator_pubkey: Some(fiber_types::Privkey::from_slice(&[99u8; 32]).pubkey()),
         store,
         currency: Currency::Fibb,
     };
@@ -745,6 +751,7 @@ async fn setup_store_backed_test_harness() -> StoreBackedTestHarness {
         token: CancellationToken::new(),
         network_actor: Some(network_actor),
         node_keypair: Some(crate::fiber::KeyPair::try_from([42u8; 32].as_slice()).unwrap()),
+        swap_ad_operator_pubkey: Some(fiber_types::Privkey::from_slice(&[99u8; 32]).pubkey()),
         store: store.clone(),
         currency: Currency::Fibb,
     };
@@ -2403,13 +2410,22 @@ fn create_test_swap_quote_invoice(
 
 /// Seed a signed swap advertisement directly into the mock gossip store.
 fn seed_test_swap_ad(rate: u128) -> (fiber_types::SwapAdvertisement, Hash256) {
+    seed_test_swap_ad_with_assets(rate, None, None)
+}
+
+/// Same as [`seed_test_swap_ad`] but with explicit pair scripts.
+fn seed_test_swap_ad_with_assets(
+    rate: u128,
+    base: Option<ckb_types::packed::Script>,
+    quote: Option<ckb_types::packed::Script>,
+) -> (fiber_types::SwapAdvertisement, Hash256) {
     use fiber_types::{Privkey, SwapAdvertisement};
     let op_key = Privkey::from_slice(&[99u8; 32]);
     let now = crate::now_timestamp_as_millis_u64();
     let ad = SwapAdvertisement::new_signed(
         Hash256::default(),
-        None,
-        None,
+        base,
+        quote,
         rate,
         3_000,
         &op_key,
@@ -2491,9 +2507,166 @@ async fn test_execute_swap_full_lifecycle_through_actor() {
     // 5. Quote leg settles with preimage -> base leg settles -> Success.
     // (The mock settle handler auto-injects the Paid event, like production.)
     harness.simulate_fiber_payment_success(payment_hash, preimage);
-    let order =
-        wait_for_swap_status(&store, payment_hash, CchOrderStatus::Success, 2000).await;
+    let order = wait_for_swap_status(&store, payment_hash, CchOrderStatus::Success, 2000).await;
     assert_eq!(order.payment_preimage, Some(preimage));
     assert!(order.failure_reason.is_none());
     assert!(order.is_final());
+}
+
+#[tokio::test]
+async fn test_execute_swap_rejects_ad_from_another_operator() {
+    use crate::cch::ExecuteSwap;
+    use crate::fiber::gossip::GossipMessageStore;
+    use fiber_types::{Privkey, SwapAdvertisement};
+
+    let (_, payment_hash) = create_valid_preimage_pair(78);
+    let store = MockCchOrderStore::new();
+    let harness = setup_test_harness_with_store(store.clone()).await;
+
+    // Signed by an operator that is not this node ([99; 32]).
+    let foreign_key = Privkey::from_slice(&[7u8; 32]);
+    let now = crate::now_timestamp_as_millis_u64();
+    let ad = SwapAdvertisement::new_signed(
+        Hash256::default(),
+        None,
+        None,
+        10_000_000_000u128,
+        3_000,
+        &foreign_key,
+        now,
+        now + 86_400_000,
+    );
+    let ad_hash = Hash256::from(ckb_hash::blake2b_256(ad.message_to_sign()));
+    store.save_swap_advertisement(ad);
+
+    let quote_invoice = create_test_swap_quote_invoice(payment_hash, 10_000, 3_600_000);
+    let err = ractor::call!(
+        harness.actor,
+        CchMessage::ExecuteSwap,
+        ExecuteSwap {
+            ad_hash,
+            base_amount: 100,
+            quote_pay_req: quote_invoice.to_string(),
+        }
+    )
+    .expect("actor call failed")
+    .expect_err("a foreign advertisement must not be executable");
+
+    assert!(
+        matches!(err, crate::cch::CchError::SwapAdNotOwned),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_execute_swap_rejects_pair_mismatch_when_invoice_is_ckb() {
+    use crate::cch::ExecuteSwap;
+    use crate::fiber::gossip::GossipMessageStore;
+    use ckb_types::prelude::{Builder, Entity, Pack};
+
+    let (_, payment_hash) = create_valid_preimage_pair(79);
+    let store = MockCchOrderStore::new();
+    let harness = setup_test_harness_with_store(store.clone()).await;
+
+    // Advertised quote is a UDT; the user's invoice is CKB (`None`).
+    // This is exactly the case the old `if let (Some, Some)` check skipped.
+    let some_udt = ckb_types::packed::Script::new_builder()
+        .code_hash(ckb_types::packed::Byte32::from_slice(&[7u8; 32]).unwrap())
+        .hash_type(ckb_types::core::ScriptHashType::Type)
+        .args(vec![1u8].pack())
+        .build();
+    let (ad, ad_hash) = seed_test_swap_ad_with_assets(10_000_000_000, None, Some(some_udt));
+    store.save_swap_advertisement(ad);
+
+    let quote_invoice = create_test_swap_quote_invoice(payment_hash, 10_000, 3_600_000);
+    let err = ractor::call!(
+        harness.actor,
+        CchMessage::ExecuteSwap,
+        ExecuteSwap {
+            ad_hash,
+            base_amount: 100,
+            quote_pay_req: quote_invoice.to_string(),
+        }
+    )
+    .expect("actor call failed")
+    .expect_err("a CKB invoice must not satisfy a UDT quote");
+
+    assert!(
+        matches!(err, crate::cch::CchError::SwapPairMismatch),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_resume_expired_swap_order_is_marked_failed() {
+    use crate::cch::SwapOrderStore;
+    use fiber_types::SwapOrder;
+
+    let (_, payment_hash) = create_valid_preimage_pair(155);
+    let store = MockCchOrderStore::new();
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let invoice = create_test_fiber_invoice(payment_hash);
+    let order = SwapOrder::new(
+        current_time - 7200,
+        3600,
+        Hash256::default(),
+        None,
+        None,
+        1,
+        0,
+        1,
+        payment_hash,
+        invoice,
+        "fibt1test".to_string(),
+    )
+    .unwrap();
+    store.insert_swap_order(order).unwrap();
+
+    let _harness = setup_test_harness_with_store(store.clone()).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let order = store.get_swap_order(&payment_hash).unwrap();
+    assert_eq!(order.status, CchOrderStatus::Failed);
+    assert_eq!(order.failure_reason.as_deref(), Some("Swap order expired"));
+}
+
+#[tokio::test]
+async fn test_resume_active_swap_order_stays_pending() {
+    use crate::cch::SwapOrderStore;
+    use fiber_types::SwapOrder;
+
+    let (_, payment_hash) = create_valid_preimage_pair(156);
+    let store = MockCchOrderStore::new();
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let invoice = create_test_fiber_invoice(payment_hash);
+    let order = SwapOrder::new(
+        current_time - 100,
+        3600,
+        Hash256::default(),
+        None,
+        None,
+        1,
+        0,
+        1,
+        payment_hash,
+        invoice,
+        "fibt1test".to_string(),
+    )
+    .unwrap();
+    store.insert_swap_order(order).unwrap();
+
+    let _harness = setup_test_harness_with_store(store.clone()).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let order = store.get_swap_order(&payment_hash).unwrap();
+    assert_eq!(order.status, CchOrderStatus::Pending);
+    assert!(order.failure_reason.is_none());
 }

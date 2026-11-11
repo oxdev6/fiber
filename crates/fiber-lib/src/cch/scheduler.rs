@@ -5,7 +5,11 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::task::AbortHandle;
 use tokio::time::Duration;
 
-use crate::cch::{order::CchOrderStore, trackers::LndTrackerMessage, CchError};
+use crate::cch::{
+    order::{CchOrderStore, SwapOrderStore},
+    trackers::LndTrackerMessage,
+    CchError,
+};
 use crate::now_timestamp_as_millis_u64;
 use fiber_types::{CchOrderStatus, Hash256};
 
@@ -97,7 +101,7 @@ impl<S> Default for CchOrderSchedulerActor<S> {
     }
 }
 
-impl<S: CchOrderStore + Send + Sync + Clone + 'static> CchOrderSchedulerActor<S> {
+impl<S: CchOrderStore + SwapOrderStore + Send + Sync + Clone + 'static> CchOrderSchedulerActor<S> {
     pub async fn start(
         args: SchedulerArgs<S>,
         root_actor: ractor::ActorCell,
@@ -110,7 +114,9 @@ impl<S: CchOrderStore + Send + Sync + Clone + 'static> CchOrderSchedulerActor<S>
 }
 
 #[async_trait::async_trait]
-impl<S: CchOrderStore + Send + Sync + 'static> Actor for CchOrderSchedulerActor<S> {
+impl<S: CchOrderStore + SwapOrderStore + Send + Sync + 'static> Actor
+    for CchOrderSchedulerActor<S>
+{
     type Msg = SchedulerMessage;
     type State = SchedulerState<S>;
     type Arguments = SchedulerArgs<S>;
@@ -181,7 +187,7 @@ impl<S: CchOrderStore + Send + Sync + 'static> Actor for CchOrderSchedulerActor<
     }
 }
 
-impl<S: CchOrderStore> SchedulerState<S> {
+impl<S: CchOrderStore + SwapOrderStore> SchedulerState<S> {
     fn push_job(
         &mut self,
         job: ScheduledJob,
@@ -257,49 +263,106 @@ impl<S: CchOrderStore> SchedulerState<S> {
         self.processing_abort_handle = Some(handle.abort_handle());
     }
 
-    /// Handle expiring an order
+    /// Handle expiring an order.
+    ///
+    /// Swap orders share the scheduler queue (jobs are keyed by payment hash)
+    /// but live under a different store prefix, so a CCH lookup miss falls
+    /// through to the swap store.
     fn expire_order(
         &self,
         mailbox: ActorRef<SchedulerMessage>,
         payment_hash: Hash256,
     ) -> Result<(), CchError> {
-        let mut order = match self.store.get_cch_order(&payment_hash) {
+        match self.store.get_cch_order(&payment_hash) {
+            Ok(mut order) => {
+                // Skip if order is already final
+                if order.is_final() {
+                    tracing::debug!("Order {:x} is already final, skipping expiry", payment_hash);
+                    return Ok(());
+                }
+
+                if order.status != CchOrderStatus::Pending {
+                    tracing::debug!(
+                        "Order {:x} is {:?}, skipping pending-order expiry",
+                        payment_hash,
+                        order.status
+                    );
+                    return Ok(());
+                }
+
+                // Store order info before updating
+                let created_at = order.created_at;
+                let expiry_delta_seconds = order.expiry_delta_seconds;
+
+                order.status = CchOrderStatus::Failed;
+                order.failure_reason = Some("Order expired".to_string());
+                self.store.update_cch_order(order);
+                tracing::info!("Expired order {:x}", payment_hash);
+
+                // Schedule prune job for this expired order
+                if let Err(err) = mailbox.send_message(SchedulerMessage::SchedulePrune {
+                    payment_hash,
+                    created_at,
+                    expiry_delta_seconds,
+                }) {
+                    tracing::error!(
+                        "Failed to schedule prune job for expired order {:x}: {}",
+                        payment_hash,
+                        err
+                    );
+                }
+
+                Ok(())
+            }
+            Err(_) => self.expire_swap_order(mailbox, payment_hash),
+        }
+    }
+
+    fn expire_swap_order(
+        &self,
+        mailbox: ActorRef<SchedulerMessage>,
+        payment_hash: Hash256,
+    ) -> Result<(), CchError> {
+        let mut order = match self.store.get_swap_order(&payment_hash) {
             Ok(order) => order,
             Err(_) => return Ok(()),
         };
 
-        // Skip if order is already final
         if order.is_final() {
-            tracing::debug!("Order {:x} is already final, skipping expiry", payment_hash);
+            tracing::debug!(
+                "Swap order {:x} is already final, skipping expiry",
+                payment_hash
+            );
             return Ok(());
         }
 
+        // Mirror CCH: only unpaid Pending orders expire here. In-flight legs
+        // are protected by their TLC expiry and settle/fail via tracking.
         if order.status != CchOrderStatus::Pending {
             tracing::debug!(
-                "Order {:x} is {:?}, skipping pending-order expiry",
+                "Swap order {:x} is {:?}, skipping pending-order expiry",
                 payment_hash,
                 order.status
             );
             return Ok(());
         }
 
-        // Store order info before updating
         let created_at = order.created_at;
         let expiry_delta_seconds = order.expiry_delta_seconds;
+        if !order.update_if_expired(current_time_secs()) {
+            return Ok(());
+        }
 
-        order.status = CchOrderStatus::Failed;
-        order.failure_reason = Some("Order expired".to_string());
-        self.store.update_cch_order(order);
-        tracing::info!("Expired order {:x}", payment_hash);
+        self.store.update_swap_order(order);
+        tracing::info!("Expired swap order {:x}", payment_hash);
 
-        // Schedule prune job for this expired order
         if let Err(err) = mailbox.send_message(SchedulerMessage::SchedulePrune {
             payment_hash,
             created_at,
             expiry_delta_seconds,
         }) {
             tracing::error!(
-                "Failed to schedule prune job for expired order {:x}: {}",
+                "Failed to schedule prune job for expired swap order {:x}: {}",
                 payment_hash,
                 err
             );
@@ -308,27 +371,38 @@ impl<S: CchOrderStore> SchedulerState<S> {
         Ok(())
     }
 
-    /// Handle pruning a final order
+    /// Handle pruning a final order.
     fn prune_order(&self, payment_hash: Hash256) -> Result<(), CchError> {
-        let order = match self.store.get_cch_order(&payment_hash) {
-            Ok(order) => order,
-            Err(_) => return Ok(()),
-        };
+        match self.store.get_cch_order(&payment_hash) {
+            Ok(order) => {
+                if !order.is_final() {
+                    tracing::debug!("Order {:x} is not final, skipping prune", payment_hash);
+                    return Ok(());
+                }
 
-        if !order.is_final() {
-            tracing::debug!("Order {:x} is not final, skipping prune", payment_hash);
-            return Ok(());
+                // Ignore the error because LndTrackerActor may exit earlier.
+                let _ = self
+                    .lnd_tracker
+                    .send_message(LndTrackerMessage::StopTracking(payment_hash));
+
+                // Delete order from store
+                self.store.delete_cch_order(&payment_hash);
+                tracing::info!("Pruned final order {:x}", payment_hash);
+                Ok(())
+            }
+            Err(_) => {
+                let Ok(order) = self.store.get_swap_order(&payment_hash) else {
+                    return Ok(());
+                };
+                if !order.is_final() {
+                    tracing::debug!("Swap order {:x} is not final, skipping prune", payment_hash);
+                    return Ok(());
+                }
+
+                self.store.delete_swap_order(&payment_hash);
+                tracing::info!("Pruned final swap order {:x}", payment_hash);
+                Ok(())
+            }
         }
-
-        // Ignore the error because LndTrackerActor may exit earlier.
-        let _ = self
-            .lnd_tracker
-            .send_message(LndTrackerMessage::StopTracking(payment_hash));
-
-        // Delete order from store
-        self.store.delete_cch_order(&payment_hash);
-        tracing::info!("Pruned final order {:x}", payment_hash);
-
-        Ok(())
     }
 }

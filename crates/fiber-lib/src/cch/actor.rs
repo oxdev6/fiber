@@ -27,7 +27,6 @@ use crate::cch::{
     CchConfig, CchError, CchOrderStore, CchStoreError, SwapOrderStore,
 };
 use crate::ckb::contracts::{get_script_by_contract, Contract};
-use ckb_types::prelude::Entity;
 use crate::fiber::gossip::GossipMessageStore;
 use crate::fiber::NetworkActorMessage;
 use crate::invoice::{CkbInvoice, CkbInvoiceStatus, Currency, InvoiceBuilder};
@@ -35,7 +34,7 @@ use crate::now_timestamp_as_millis_u64;
 use crate::store::store_impl::StoreChange;
 use crate::time::Duration;
 use fiber_types::{AttemptStatus, CchInvoice, CchOrder, CchOrderStatus, HashAlgorithm};
-use fiber_types::{Hash256, Privkey, SwapOrder, SwapOrderError};
+use fiber_types::{Hash256, Privkey, Pubkey, SwapOrder, SwapOrderError};
 
 pub const ACTION_RETRY_BASE_MILLIS: u64 = 1000; // 1 second initial delay
 pub const ACTION_RETRY_MAX_MILLIS: u64 = 600_000; // 10 minute max delay
@@ -131,6 +130,11 @@ pub struct CchArgs<S> {
     pub token: CancellationToken,
     pub network_actor: Option<ActorRef<NetworkActorMessage>>,
     pub node_keypair: Option<crate::fiber::KeyPair>,
+    /// Public key that this node uses to sign swap advertisements
+    /// (`publish_swap_advertisement`). `execute_swap` only accepts
+    /// advertisements signed by this key; `None` disables execution so an
+    /// unverified third-party advertisement can never be honoured.
+    pub swap_ad_operator_pubkey: Option<Pubkey>,
     pub store: S,
     /// The CKB network currency this node is configured for.
     /// Used to validate that incoming invoices match the expected network.
@@ -141,6 +145,9 @@ pub struct CchState<S> {
     pub(super) config: CchConfig,
     pub(super) fiber_agent_ref: CchFiberAgentRef,
     pub(super) node_keypair: Option<(PublicKey, SecretKey)>,
+    /// Key that signs this node's swap advertisements; used to reject ads
+    /// published by other operators.
+    pub(super) swap_ad_operator_pubkey: Option<Pubkey>,
     pub(super) lnd_connection: LndConnectionInfo,
     pub(super) lnd_tracker: ActorRef<LndTrackerMessage>,
     pub(super) scheduler: ActorRef<SchedulerMessage>,
@@ -150,8 +157,8 @@ pub struct CchState<S> {
 }
 
 #[async_trait::async_trait]
-impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clone + 'static>
-    Actor for CchActor<S>
+impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clone + 'static> Actor
+    for CchActor<S>
 {
     type Msg = CchMessage;
     type State = CchState<S>;
@@ -261,6 +268,7 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
             fiber_agent_ref,
             store: args.store,
             node_keypair,
+            swap_ad_operator_pubkey: args.swap_ad_operator_pubkey,
             lnd_connection,
             lnd_tracker,
             scheduler,
@@ -315,6 +323,40 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
             }
         }
 
+        // Resume Fiber-to-Fiber swap orders. They live under a separate key
+        // prefix, so the CCH loop above never sees them.
+        for mut order in state
+            .store
+            .get_swap_order_keys_iter()
+            .into_iter()
+            .filter_map(|payment_hash| state.store.get_swap_order(&payment_hash).ok())
+        {
+            if order.is_final() {
+                state.schedule_swap_job(&order);
+                continue;
+            }
+
+            if order.status == CchOrderStatus::Pending && order.update_if_expired(current_time) {
+                let payment_hash = order.payment_hash;
+                state.store.update_swap_order(order.clone());
+                state.schedule_swap_job(&order);
+                tracing::info!("Marked expired swap order {:x} as Failed", payment_hash);
+                continue;
+            }
+
+            state.schedule_swap_job(&order);
+
+            // Re-arm leg actions for orders that were mid-flight at shutdown.
+            let actions = swap_on_entering(&order);
+            if let Err(err) = append_swap_actions(myself.clone(), order.payment_hash, actions) {
+                tracing::error!(
+                    "Failed to schedule resume actions for swap order {:x}: {}",
+                    order.payment_hash,
+                    err
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -356,14 +398,9 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
             CchMessage::ExecuteSwap(req, port) => {
                 let result = state.execute_swap(req).await;
                 if let Ok(order) = &result {
-                    // Expiry job only; leg tracking/dispatch lands in S3b.
-                    // Scheduler keys are payment hashes, so swap orders reuse
-                    // the same expiry/prune jobs as CCH orders.
-                    let _ = state.scheduler.send_message(SchedulerMessage::ScheduleExpiry {
-                        payment_hash: order.payment_hash,
-                        created_at: order.created_at,
-                        expiry_delta_seconds: order.expiry_delta_seconds,
-                    });
+                    // Scheduler keys are payment hashes; `schedule_swap_job`
+                    // routes to expiry or prune depending on order status.
+                    state.schedule_swap_job(order);
                 }
                 if !port.is_closed() {
                     // ignore error
@@ -380,10 +417,21 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore + Send + Sync + Clon
                 Ok(())
             }
             CchMessage::GetSwapOrder(payment_hash, port) => {
-                let result = state
-                    .store
-                    .get_swap_order(&payment_hash)
-                    .map_err(Into::into);
+                let result = match state.store.get_swap_order(&payment_hash) {
+                    Ok(mut order) => {
+                        // Orders are also expired by the scheduler, but a
+                        // restart can lose that job; never report a stale
+                        // Pending order as live.
+                        if order.status == CchOrderStatus::Pending
+                            && order.update_if_expired(now_timestamp_as_millis_u64() / 1000)
+                        {
+                            state.store.update_swap_order(order.clone());
+                            state.schedule_swap_job(&order);
+                        }
+                        Ok(order)
+                    }
+                    Err(err) => Err(err.into()),
+                };
                 if !port.is_closed() {
                     // ignore error
                     let _ = port.send(result);
@@ -744,6 +792,19 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore> CchState<S> {
             .filter(|(_, ad)| !ad.is_expired(now_ms))
             .ok_or(CchError::SwapAdNotFound(req.ad_hash))?;
 
+        // Only advertise-and-execute for this chain, and only honour quotes
+        // this node actually published. Without these checks any gossiped ad
+        // from any peer could be executed here at terms we never offered.
+        if ad.chain_hash != crate::fiber::network::get_chain_hash() {
+            return Err(CchError::SwapAdChainMismatch);
+        }
+        let local_operator = self
+            .swap_ad_operator_pubkey
+            .ok_or(CchError::SwapAdOperatorKeyUnavailable)?;
+        if ad.operator_pubkey != local_operator {
+            return Err(CchError::SwapAdNotOwned);
+        }
+
         // `from_str` requires a valid signature, so parsing also guarantees
         // the user's quote invoice is signed.
         let quote_invoice = CkbInvoice::from_str(&req.quote_pay_req)?;
@@ -758,17 +819,16 @@ impl<S: CchOrderStore + SwapOrderStore + GossipMessageStore> CchState<S> {
         }
         let payment_hash = *quote_invoice.payment_hash();
 
-        // Pair match: when both sides name scripts, they must agree.
-        if let (Some(quote_script), Some(invoice_script)) =
-            (&ad.quote_udt_script, quote_invoice.udt_type_script())
-        {
-            if invoice_script.as_slice() != quote_script.as_slice() {
-                return Err(CchError::SwapPairMismatch);
-            }
+        // Pair match: the advertised quote asset and the invoice asset must be
+        // exactly the same, including the CKB case where both are `None`.
+        if ad.quote_udt_script.as_ref() != quote_invoice.udt_type_script() {
+            return Err(CchError::SwapPairMismatch);
         }
 
         // Rate math is frozen here; any drift between asked and computed fails.
-        let asked = quote_invoice.amount().ok_or(CchError::CKBInvoiceMissingAmount)?;
+        let asked = quote_invoice
+            .amount()
+            .ok_or(CchError::CKBInvoiceMissingAmount)?;
         let expected = req
             .base_amount
             .checked_mul(ad.rate)
@@ -1245,7 +1305,7 @@ fn schedule_swap_action_retry(
     myself.send_after(delay, move || CchMessage::ExecuteSwapAction {
         payment_hash,
         action,
-        retry_count,
+        retry_count: retry_count.saturating_add(1),
     });
 }
 

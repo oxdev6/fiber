@@ -85,6 +85,12 @@ pub enum CchError {
     FiberNodeError(anyhow::Error),
     #[error("Swap advertisement not found or expired: {0:?}")]
     SwapAdNotFound(Hash256),
+    #[error("Swap advertisement chain hash does not match the local chain")]
+    SwapAdChainMismatch,
+    #[error("Swap advertisement was not published by this node")]
+    SwapAdNotOwned,
+    #[error("No swap advertisement operator key is configured; refusing to execute an unverified advertisement")]
+    SwapAdOperatorKeyUnavailable,
     #[error("Swap quote amount mismatch: invoice asks {asked}, ad rate gives {expected}")]
     SwapRateMismatch { asked: u128, expected: u128 },
     #[error("Swap pair mismatch with advertisement")]

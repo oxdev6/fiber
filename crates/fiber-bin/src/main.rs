@@ -456,6 +456,15 @@ async fn run_node(
                     None
                 };
 
+            // `publish_swap_advertisement` signs with the CKB key. Pass its
+            // public key through so `execute_swap` only honours this node's
+            // own advertisements.
+            let swap_ad_operator_pubkey = config
+                .ckb
+                .as_ref()
+                .and_then(|ckb_config| ckb_config.read_secret_key().ok())
+                .map(|secret_key| fnn::fiber_types::Privkey::from(secret_key).pubkey());
+
             match Actor::spawn_linked(
                 Some("cch actor".to_string()),
                 CchActor::default(),
@@ -467,6 +476,7 @@ async fn run_node(
                     currency: cch_currency,
                     store: store.clone(),
                     node_keypair,
+                    swap_ad_operator_pubkey,
                 },
                 root_actor.get_cell(),
             )
